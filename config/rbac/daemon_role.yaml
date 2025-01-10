@@ -53,8 +53,6 @@ rules:
   verbs:
   - get
   - list
-  - patch
-  - update
   - watch
 - apiGroups:
   - ""
@@ -65,10 +63,18 @@ rules:
   - patch
   - update
 - apiGroups:
-  - ""
+  - apps.kruise.io
   resources:
-  - secrets
+  - nodepodprobes
   verbs:
   - get
   - list
   - watch
+- apiGroups:
+  - apps.kruise.io
+  resources:
+  - nodepodprobes/status
+  verbs:
+  - get
+  - patch
+  - update

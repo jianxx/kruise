@@ -23,7 +23,6 @@ import (
 	"strings"
 	"time"
 
-	kruiseclientset "github.com/openkruise/kruise/pkg/client/clientset/versioned"
 	v1 "k8s.io/api/core/v1"
 	apiextensionsclientset "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -37,16 +36,15 @@ import (
 	scaleclient "k8s.io/client-go/scale"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 
+	kruiseclientset "github.com/openkruise/kruise/pkg/client/clientset/versioned"
+
 	"github.com/onsi/ginkgo"
 	"github.com/onsi/gomega"
 )
 
 const (
-	maxKubectlExecRetries = 5
-
-	// DefaultNamespaceDeletionTimeout ref https://github.com/kubernetes/kubernetes/issues/47135
-	// TODO(mikedanese): reset this to 5 minutes once #47135 is resolved.
-	DefaultNamespaceDeletionTimeout = 10 * time.Minute
+	maxKubectlExecRetries           = 5
+	DefaultNamespaceDeletionTimeout = 5 * time.Minute
 )
 
 // Framework supports common operations used by e2e tests; it will keep a client & a namespace for you.
@@ -315,6 +313,11 @@ func (f *Framework) WaitForPodRunning(podName string) error {
 // KruiseDescribe is a wrapper function for ginkgo describe.  Adds namespacing.
 func KruiseDescribe(text string, body func()) bool {
 	return ginkgo.Describe("[kruise.io] "+text, body)
+}
+
+// KruisePDescribe is a wrapper function for ginkgo describe.  Adds namespacing.
+func KruisePDescribe(text string, body func()) bool {
+	return ginkgo.PDescribe("[kruise.io] "+text, body)
 }
 
 // ConformanceIt is a wrapper function for ginkgo It.  Adds "[Conformance]" tag and makes static analysis easier.

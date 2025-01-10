@@ -24,6 +24,26 @@ import (
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
+type PubOperation string
+
+const (
+	// PubProtectOperationAnnotation indicates the pub protected Operation[DELETE,UPDATE,EVICT]
+	// if annotations[kruise.io/pub-protect-operations]=EVICT indicates the pub only protect evict pod
+	// if the annotations do not exist, the default DELETE,EVICT,UPDATE are protected
+	PubProtectOperationAnnotation = "kruise.io/pub-protect-operations"
+	// pod webhook operation
+	PubUpdateOperation PubOperation = "UPDATE"
+	PubDeleteOperation PubOperation = "DELETE"
+	PubEvictOperation  PubOperation = "EVICT"
+	// PubProtectTotalReplicasAnnotation is the target replicas.
+	// By default, PUB will get the target replicas through workload.spec.replicas. but there are some scenarios that may workload doesn't
+	// implement scale subresources or Pod doesn't have workload management. In this scenario, you can set pub.kruise.io/protect-total-replicas
+	// in pub annotations to get the target replicas to realize the same effect of protection ability.
+	PubProtectTotalReplicasAnnotation = "pub.kruise.io/protect-total-replicas"
+	// Marked the pod will not be pub-protected, solving the scenario of force pod deletion
+	PodPubNoProtectionAnnotation = "pub.kruise.io/no-protect"
+)
+
 // PodUnavailableBudgetSpec defines the desired state of PodUnavailableBudget
 type PodUnavailableBudgetSpec struct {
 	// Selector label query over pods managed by the budget

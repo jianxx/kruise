@@ -20,41 +20,36 @@ import (
 	"sort"
 	"time"
 
-	"sigs.k8s.io/controller-runtime/pkg/controller"
-
-	"sigs.k8s.io/controller-runtime/pkg/handler"
-	"sigs.k8s.io/controller-runtime/pkg/source"
-
-	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
-	"github.com/robfig/cron"
+	"github.com/robfig/cron/v3"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ref "k8s.io/client-go/tools/reference"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/source"
+
+	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
 )
 
-func watchBroadcastJob(c controller.Controller) error {
-	if err := c.Watch(&source.Kind{Type: &appsv1alpha1.BroadcastJob{}}, &handler.EnqueueRequestForOwner{
-		IsController: true,
-		OwnerType:    &appsv1alpha1.AdvancedCronJob{},
-	}); err != nil {
+func watchBroadcastJob(mgr manager.Manager, c controller.Controller) error {
+	if err := c.Watch(source.Kind(mgr.GetCache(), &appsv1alpha1.BroadcastJob{}), handler.EnqueueRequestForOwner(
+		mgr.GetScheme(), mgr.GetRESTMapper(), &appsv1alpha1.AdvancedCronJob{}, handler.OnlyControllerOwner())); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-// +kubebuilder:rbac:groups=apps.kruise.io,resources=broadcastjobs,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=apps.kruise.io,resources=broadcastjobs/status,verbs=get;update;patch
-
 func (r *ReconcileAdvancedCronJob) reconcileBroadcastJob(ctx context.Context, req ctrl.Request, advancedCronJob appsv1alpha1.AdvancedCronJob) (ctrl.Result, error) {
 	advancedCronJob.Status.Type = appsv1alpha1.BroadcastJobTemplate
 
 	var childJobs appsv1alpha1.BroadcastJobList
 	if err := r.List(ctx, &childJobs, client.InNamespace(advancedCronJob.Namespace), client.MatchingFields{jobOwnerKey: advancedCronJob.Name}); err != nil {
-		klog.Error(err, "unable to list child Jobs", req.NamespacedName)
+		klog.ErrorS(err, "Unable to list child Jobs", "advancedCronJob", req)
 		return ctrl.Result{}, err
 	}
 
@@ -103,7 +98,7 @@ func (r *ReconcileAdvancedCronJob) reconcileBroadcastJob(ctx context.Context, re
 		// the active jobs themselves.
 		scheduledTimeForJob, err := getScheduledTimeForJob(&job)
 		if err != nil {
-			klog.Error(err, "unable to parse schedule time for child broadcastjob ", job.Name, req.NamespacedName)
+			klog.ErrorS(err, "Unable to parse schedule time for child BroadcastJob", "broadcastJob", klog.KObj(&job), "advancedCronJob", req)
 			continue
 		}
 		if scheduledTimeForJob != nil {
@@ -125,15 +120,15 @@ func (r *ReconcileAdvancedCronJob) reconcileBroadcastJob(ctx context.Context, re
 	for _, activeJob := range activeJobs {
 		jobRef, err := ref.GetReference(r.scheme, activeJob)
 		if err != nil {
-			klog.Error(err, "unable to make reference to active broadcastjob ", " job ", activeJob, req.NamespacedName)
+			klog.ErrorS(err, "Unable to make reference to active BroadcastJob", "broadcastJob", klog.KObj(activeJob), "advancedCronJob", req)
 			continue
 		}
 		advancedCronJob.Status.Active = append(advancedCronJob.Status.Active, *jobRef)
 	}
 
-	klog.V(1).Info("advancedCronJob count ", " active advancedCronJob ", len(activeJobs), " successful advancedCronJob ", len(successfulJobs), " failed advancedCronJob ", len(failedJobs), req.NamespacedName)
+	klog.V(1).InfoS("AdvancedCronJob count", "activeJobCount", len(activeJobs), "successfulJobCount", len(successfulJobs), "failedJobCount", len(failedJobs), "advancedCronJob", req)
 	if err := r.updateAdvancedJobStatus(req, &advancedCronJob); err != nil {
-		klog.Error(err, "unable to update AdvancedCronJob status", req.NamespacedName)
+		klog.ErrorS(err, "Unable to update AdvancedCronJob status", "advancedCronJob", req)
 		return ctrl.Result{}, err
 	}
 
@@ -159,9 +154,9 @@ func (r *ReconcileAdvancedCronJob) reconcileBroadcastJob(ctx context.Context, re
 				break
 			}
 			if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); client.IgnoreNotFound(err) != nil {
-				klog.Error(err, "unable to delete old failed broadcastjob", "job", job, req.NamespacedName)
+				klog.ErrorS(err, "Unable to delete old failed BroadcastJob", "oldFailedBroadcastJob", klog.KObj(job), "advancedCronJob", req)
 			} else {
-				klog.V(0).Info("deleted old failed broadcastjob", "job", job, req.NamespacedName)
+				klog.InfoS("Deleted old failed BroadcastJob", "oldFailedBroadcastJob", klog.KObj(job), "advancedCronJob", req)
 			}
 		}
 	}
@@ -178,9 +173,9 @@ func (r *ReconcileAdvancedCronJob) reconcileBroadcastJob(ctx context.Context, re
 				break
 			}
 			if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); (err) != nil {
-				klog.Error(err, "unable to delete old successful broadcastjob ", job.Name, req.NamespacedName)
+				klog.ErrorS(err, "Unable to delete old successful BroadcastJob", "oldSuccessfulBroadcastJob", klog.KObj(job), "advancedCronJob", req)
 			} else {
-				klog.V(0).Info("deleted old successful broadcastjob ", job.Name, req.NamespacedName)
+				klog.InfoS("Deleted old successful BroadcastJob", "oldSuccessfulBroadcastJob", klog.KObj(job), "advancedCronJob", req)
 			}
 		}
 	}
@@ -192,7 +187,7 @@ func (r *ReconcileAdvancedCronJob) reconcileBroadcastJob(ctx context.Context, re
 	*/
 
 	if advancedCronJob.Spec.Paused != nil && *advancedCronJob.Spec.Paused {
-		klog.V(1).Info("advancedCronJob paused, skipping", req.NamespacedName)
+		klog.V(1).InfoS("AdvancedCronJob paused, skipping", "advancedCronJob", req)
 		return ctrl.Result{}, nil
 	}
 
@@ -212,9 +207,9 @@ func (r *ReconcileAdvancedCronJob) reconcileBroadcastJob(ctx context.Context, re
 		and the next run, so that we can know when it's time to reconcile again.
 	*/
 	getNextSchedule := func(cronJob *appsv1alpha1.AdvancedCronJob, now time.Time) (lastMissed time.Time, next time.Time, err error) {
-		sched, err := cron.ParseStandard(cronJob.Spec.Schedule)
+		sched, err := cron.ParseStandard(formatSchedule(cronJob))
 		if err != nil {
-			return time.Time{}, time.Time{}, fmt.Errorf("Unparseable schedule %q: %v", cronJob.Spec.Schedule, err)
+			return time.Time{}, time.Time{}, fmt.Errorf("unparsable schedule %q: %v", cronJob.Spec.Schedule, err)
 		}
 
 		// for optimization purposes, cheat a bit and start from our last observed run time
@@ -270,7 +265,7 @@ func (r *ReconcileAdvancedCronJob) reconcileBroadcastJob(ctx context.Context, re
 	now := realClock{}.Now()
 	missedRun, nextRun, err := getNextSchedule(&advancedCronJob, now)
 	if err != nil {
-		klog.Error(err, "unable to figure out CronJob schedule", req.NamespacedName)
+		klog.ErrorS(err, "Unable to figure out CronJob schedule", "advancedCronJob", req)
 		// we don't really care about requeuing until we get an update that
 		// fixes the schedule, so don't return an error
 		return ctrl.Result{}, nil
@@ -287,7 +282,7 @@ func (r *ReconcileAdvancedCronJob) reconcileBroadcastJob(ctx context.Context, re
 		If we've missed a run, and we're still within the deadline to start it, we'll need to run a job.
 	*/
 	if missedRun.IsZero() {
-		klog.V(1).Info("no upcoming scheduled times, sleeping until next now ", now, " and next run ", nextRun, req.NamespacedName)
+		klog.V(1).InfoS("No upcoming scheduled times, sleeping until next run", "now", now, "nextRun", nextRun, "advancedCronJob", req)
 		return scheduledResult, nil
 	}
 
@@ -297,7 +292,7 @@ func (r *ReconcileAdvancedCronJob) reconcileBroadcastJob(ctx context.Context, re
 		tooLate = missedRun.Add(time.Duration(*advancedCronJob.Spec.StartingDeadlineSeconds) * time.Second).Before(now)
 	}
 	if tooLate {
-		klog.V(1).Info("missed starting deadline for last run, sleeping till next", "current run", missedRun, req.NamespacedName)
+		klog.V(1).InfoS("Missed starting deadline for last run, sleeping till next run", "missedRun", missedRun, "advancedCronJob", req)
 		return scheduledResult, nil
 	}
 
@@ -309,7 +304,7 @@ func (r *ReconcileAdvancedCronJob) reconcileBroadcastJob(ctx context.Context, re
 	// figure out how to run this job -- concurrency policy might forbid us from running
 	// multiple at the same time...
 	if advancedCronJob.Spec.ConcurrencyPolicy == appsv1alpha1.ForbidConcurrent && len(activeJobs) > 0 {
-		klog.V(1).Info("concurrency policy blocks concurrent runs, skipping", "num active", len(activeJobs), req.NamespacedName)
+		klog.V(1).InfoS("Concurrency policy blocks concurrent runs, skipping", "activeBroadcastJobCount", len(activeJobs), "advancedCronJob", req)
 		return scheduledResult, nil
 	}
 
@@ -318,7 +313,7 @@ func (r *ReconcileAdvancedCronJob) reconcileBroadcastJob(ctx context.Context, re
 		for _, activeJob := range activeJobs {
 			// we don't care if the job was already deleted
 			if err := r.Delete(ctx, activeJob, client.PropagationPolicy(metav1.DeletePropagationBackground)); client.IgnoreNotFound(err) != nil {
-				klog.Error(err, "unable to delete active broadcastjob", "job", activeJob, req.NamespacedName)
+				klog.ErrorS(err, "Unable to delete active broadcastjob", "broadcastJob", klog.KObj(activeJob), "advancedCronJob", req)
 				return ctrl.Result{}, err
 			}
 		}
@@ -365,18 +360,18 @@ func (r *ReconcileAdvancedCronJob) reconcileBroadcastJob(ctx context.Context, re
 	// actually make the job...
 	job, err := constructBrJobForCronJob(&advancedCronJob, missedRun)
 	if err != nil {
-		klog.Error(err, "unable to construct broadcastjob from template", req.NamespacedName)
+		klog.ErrorS(err, "Unable to construct broadcastjob from template", "advancedCronJob", req)
 		// don't bother requeuing until we get a change to the spec
 		return scheduledResult, nil
 	}
 
 	// ...and create it on the cluster
 	if err := r.Create(ctx, job); err != nil {
-		klog.Error(err, "unable to create BroadcastJob for CronJob", "job", job, req.NamespacedName)
+		klog.ErrorS(err, "Unable to create BroadcastJob for CronJob", "broadcastJob", klog.KObj(job), "advancedCronJob", req)
 		return ctrl.Result{}, err
 	}
 
-	klog.V(1).Info("created BroadcastJob for CronJob run", "job", job, req.NamespacedName)
+	klog.V(1).InfoS("Created BroadcastJob for CronJob run", "broadcastJob", klog.KObj(job), "advancedCronJob", req)
 
 	/*
 		### 7: Requeue when we either see a running job or it's time for the next scheduled run

@@ -20,8 +20,8 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"io/ioutil"
 	"net/http"
+	"os"
 	"path"
 	"sync"
 
@@ -40,7 +40,7 @@ var (
 )
 
 func loadHTTPClientWithCACert() error {
-	caCert, err := ioutil.ReadFile(caCertFilePath)
+	caCert, err := os.ReadFile(caCertFilePath)
 	if err != nil {
 		return err
 	}
@@ -72,17 +72,17 @@ func watchCACert(watcher *fsnotify.Watcher) {
 				continue
 			}
 
-			klog.Infof("Watched ca-cert %v %v", event.Name, event.Op)
+			klog.InfoS("Watched ca-cert", "eventName", event.Name, "operation", event.Op)
 
 			// If the file was removed, re-add the watch.
 			if isRemove(event) {
 				if err := watcher.Add(event.Name); err != nil {
-					klog.Errorf("Failed to re-watch ca-cert %v: %v", event.Name, err)
+					klog.ErrorS(err, "Failed to re-watch ca-cert", "eventName", event.Name)
 				}
 			}
 
 			if err := loadHTTPClientWithCACert(); err != nil {
-				klog.Errorf("Failed to reload ca-cert %v: %v", event.Name, err)
+				klog.ErrorS(err, "Failed to reload ca-cert", "eventName", event.Name)
 			}
 
 		case err, ok := <-watcher.Errors:
@@ -90,7 +90,7 @@ func watchCACert(watcher *fsnotify.Watcher) {
 			if !ok {
 				return
 			}
-			klog.Errorf("Failed to watch ca-cert: %v", err)
+			klog.ErrorS(err, "Failed to watch ca-cert")
 		}
 	}
 }
@@ -132,8 +132,5 @@ func Checker(_ *http.Request) error {
 	lock.Lock()
 	defer lock.Unlock()
 	_, err = client.Do(req)
-	if err != nil {
-		return err
-	}
-	return nil
+	return err
 }

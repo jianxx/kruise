@@ -25,15 +25,6 @@ import (
 	"testing"
 	"time"
 
-	appsv1beta1 "github.com/openkruise/kruise/apis/apps/v1beta1"
-	kruiseclientset "github.com/openkruise/kruise/pkg/client/clientset/versioned"
-	kruisefake "github.com/openkruise/kruise/pkg/client/clientset/versioned/fake"
-	kruiseinformers "github.com/openkruise/kruise/pkg/client/informers/externalversions"
-	kruiseappsinformers "github.com/openkruise/kruise/pkg/client/informers/externalversions/apps/v1beta1"
-	kruiseappslisters "github.com/openkruise/kruise/pkg/client/listers/apps/v1beta1"
-	"github.com/openkruise/kruise/pkg/util/inplaceupdate"
-	"github.com/openkruise/kruise/pkg/util/lifecycle"
-	"github.com/openkruise/kruise/pkg/util/revisionadapter"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -45,6 +36,7 @@ import (
 	"k8s.io/client-go/informers"
 	appsinformers "k8s.io/client-go/informers/apps/v1"
 	coreinformers "k8s.io/client-go/informers/core/v1"
+	storageinformers "k8s.io/client-go/informers/storage/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -56,6 +48,16 @@ import (
 	"k8s.io/kubernetes/pkg/controller"
 	"k8s.io/kubernetes/pkg/controller/history"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	appsv1beta1 "github.com/openkruise/kruise/apis/apps/v1beta1"
+	kruiseclientset "github.com/openkruise/kruise/pkg/client/clientset/versioned"
+	kruisefake "github.com/openkruise/kruise/pkg/client/clientset/versioned/fake"
+	kruiseinformers "github.com/openkruise/kruise/pkg/client/informers/externalversions"
+	kruiseappsinformers "github.com/openkruise/kruise/pkg/client/informers/externalversions/apps/v1beta1"
+	kruiseappslisters "github.com/openkruise/kruise/pkg/client/listers/apps/v1beta1"
+	"github.com/openkruise/kruise/pkg/util/inplaceupdate"
+	"github.com/openkruise/kruise/pkg/util/lifecycle"
+	"github.com/openkruise/kruise/pkg/util/revisionadapter"
 )
 
 const statefulSetResyncPeriod = 30 * time.Second
@@ -129,7 +131,7 @@ func TestStatefulSetControllerRespectsTermination(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 	}
-	ssc.syncStatefulSet(set, pods)
+	ssc.syncStatefulSet(context.TODO(), set, pods)
 	selector, err := metav1.LabelSelectorAsSelector(set.Spec.Selector)
 	if err != nil {
 		t.Error(err)
@@ -142,8 +144,8 @@ func TestStatefulSetControllerRespectsTermination(t *testing.T) {
 		t.Error("StatefulSet does not respect termination")
 	}
 	sort.Sort(ascendingOrdinal(pods))
-	spc.DeleteStatefulPod(set, pods[3])
-	spc.DeleteStatefulPod(set, pods[4])
+	spc.DeletePod(pods[3])
+	spc.DeletePod(pods[4])
 	*set.Spec.Replicas = 0
 	if err := scaleDownStatefulSetController(set, ssc, spc); err != nil {
 		t.Errorf("Failed to turn down StatefulSet : %s", err)
@@ -193,7 +195,7 @@ func TestStatefulSetControllerBlocksScaling(t *testing.T) {
 		t.Error("StatefulSet does not block scaling")
 	}
 	sort.Sort(ascendingOrdinal(pods))
-	spc.DeleteStatefulPod(set, pods[0])
+	spc.DeletePod(pods[0])
 	ssc.enqueueStatefulSet(set)
 	fakeWorker(ssc)
 	pods, err = spc.podsLister.Pods(set.Namespace).List(selector)
@@ -547,7 +549,7 @@ func TestGetPodsForStatefulSetAdopt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pods, err := ssc.getPodsForStatefulSet(set, selector)
+	pods, err := ssc.getPodsForStatefulSet(context.TODO(), set, selector)
 	if err != nil {
 		t.Fatalf("getPodsForStatefulSet() error: %v", err)
 	}
@@ -584,7 +586,7 @@ func TestGetPodsForStatefulSetRelease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pods, err := ssc.getPodsForStatefulSet(set, selector)
+	pods, err := ssc.getPodsForStatefulSet(context.TODO(), set, selector)
 	if err != nil {
 		t.Fatalf("getPodsForStatefulSet() error: %v", err)
 	}
@@ -613,18 +615,20 @@ func splitObjects(initialObjects []runtime.Object) ([]runtime.Object, []runtime.
 	return kubeObjects, kruiseObjects
 }
 
-func newFakeStatefulSetController(initialObjects ...runtime.Object) (*StatefulSetController, *fakeStatefulPodControl) {
+func newFakeStatefulSetController(initialObjects ...runtime.Object) (*StatefulSetController, *fakeObjectManager) {
 	kubeObjects, kruiseObjects := splitObjects(initialObjects)
 	client := fake.NewSimpleClientset(kubeObjects...)
 	kruiseClient := kruisefake.NewSimpleClientset(kruiseObjects...)
 	informerFactory := informers.NewSharedInformerFactory(client, controller.NoResyncPeriodFunc())
 	kruiseInformerFactory := kruiseinformers.NewSharedInformerFactory(kruiseClient, controller.NoResyncPeriodFunc())
-	fpc := newFakeStatefulPodControl(informerFactory.Core().V1().Pods(), kruiseInformerFactory.Apps().V1beta1().StatefulSets())
+	om := newFakeObjectManager(informerFactory, kruiseInformerFactory)
+	fpc := NewStatefulPodControlFromManager(om, &noopRecorder{})
 	ssu := newFakeStatefulSetStatusUpdater(kruiseInformerFactory.Apps().V1beta1().StatefulSets())
 	ssc := NewStatefulSetController(
 		informerFactory.Core().V1().Pods(),
 		kruiseInformerFactory.Apps().V1beta1().StatefulSets(),
 		informerFactory.Core().V1().PersistentVolumeClaims(),
+		informerFactory.Storage().V1().StorageClasses(),
 		informerFactory.Apps().V1().ControllerRevisions(),
 		client,
 		kruiseClient,
@@ -637,7 +641,7 @@ func newFakeStatefulSetController(initialObjects ...runtime.Object) (*StatefulSe
 	lifecycleControl := lifecycle.NewForInformer(informerFactory.Core().V1().Pods())
 	ssc.control = NewDefaultStatefulSetControl(fpc, inplaceControl, lifecycleControl, ssu, ssh, recorder)
 
-	return ssc, fpc
+	return ssc, om
 }
 
 func fakeWorker(ssc *StatefulSetController) {
@@ -655,7 +659,7 @@ func getPodAtOrdinal(pods []*v1.Pod, ordinal int) *v1.Pod {
 	return pods[ordinal]
 }
 
-func scaleUpStatefulSetController(set *appsv1beta1.StatefulSet, ssc *StatefulSetController, spc *fakeStatefulPodControl) error {
+func scaleUpStatefulSetController(set *appsv1beta1.StatefulSet, ssc *StatefulSetController, spc *fakeObjectManager) error {
 	spc.setsIndexer.Add(set)
 	ssc.enqueueStatefulSet(set)
 	fakeWorker(ssc)
@@ -703,7 +707,7 @@ func scaleUpStatefulSetController(set *appsv1beta1.StatefulSet, ssc *StatefulSet
 	return assertMonotonicInvariants(set, spc)
 }
 
-func scaleDownStatefulSetController(set *appsv1beta1.StatefulSet, ssc *StatefulSetController, spc *fakeStatefulPodControl) error {
+func scaleDownStatefulSetController(set *appsv1beta1.StatefulSet, ssc *StatefulSetController, spc *fakeObjectManager) error {
 	selector, err := metav1.LabelSelectorAsSelector(set.Spec.Selector)
 	if err != nil {
 		return err
@@ -726,7 +730,7 @@ func scaleDownStatefulSetController(set *appsv1beta1.StatefulSet, ssc *StatefulS
 	pod = getPodAtOrdinal(pods, ord)
 	ssc.updatePod(&prev, pod)
 	fakeWorker(ssc)
-	spc.DeleteStatefulPod(set, pod)
+	spc.DeletePod(pod)
 	ssc.deletePod(pod)
 	fakeWorker(ssc)
 	for set.Status.Replicas > *set.Spec.Replicas {
@@ -743,7 +747,7 @@ func scaleDownStatefulSetController(set *appsv1beta1.StatefulSet, ssc *StatefulS
 		pod = getPodAtOrdinal(pods, ord)
 		ssc.updatePod(&prev, pod)
 		fakeWorker(ssc)
-		spc.DeleteStatefulPod(set, pod)
+		spc.DeletePod(pod)
 		ssc.deletePod(pod)
 		fakeWorker(ssc)
 		obj, _, err := spc.setsIndexer.Get(set)
@@ -774,6 +778,7 @@ func NewStatefulSetController(
 	podInformer coreinformers.PodInformer,
 	setInformer kruiseappsinformers.StatefulSetInformer,
 	pvcInformer coreinformers.PersistentVolumeClaimInformer,
+	scInformer storageinformers.StorageClassInformer,
 	revInformer appsinformers.ControllerRevisionInformer,
 	kubeClient clientset.Interface,
 	kruiseClient kruiseclientset.Interface,
@@ -787,11 +792,11 @@ func NewStatefulSetController(
 		ReconcileStatefulSet: ReconcileStatefulSet{
 			kruiseClient: kruiseClient,
 			control: NewDefaultStatefulSetControl(
-				NewRealStatefulPodControl(
+				NewStatefulPodControl(
 					kubeClient,
-					setInformer.Lister(),
 					podInformer.Lister(),
 					pvcInformer.Lister(),
+					scInformer.Lister(),
 					recorder),
 				inplaceupdate.NewForTypedClient(kubeClient, revisionadapter.NewDefaultImpl()),
 				lifecycle.NewForTypedClient(kubeClient),
@@ -826,7 +831,8 @@ func NewStatefulSetController(
 				oldPS := old.(*appsv1beta1.StatefulSet)
 				curPS := cur.(*appsv1beta1.StatefulSet)
 				if oldPS.Status.Replicas != curPS.Status.Replicas {
-					klog.V(4).Infof("Observed updated replica count for StatefulSet: %v, %d->%d", curPS.Name, oldPS.Status.Replicas, curPS.Status.Replicas)
+					klog.V(4).InfoS("Observed updated replica count for StatefulSet",
+						"statefulSetName", curPS.Name, "oldReplicas", oldPS.Status.Replicas, "newReplicas", curPS.Status.Replicas)
 				}
 				ssc.enqueueStatefulSet(cur)
 			},
@@ -843,8 +849,8 @@ func (ssc *StatefulSetController) Run(workers int, stopCh <-chan struct{}) {
 	defer utilruntime.HandleCrash()
 	defer ssc.queue.ShutDown()
 
-	klog.Infof("Starting stateful set controller")
-	defer klog.Infof("Shutting down statefulset controller")
+	klog.InfoS("Starting stateful set controller")
+	defer klog.InfoS("Shutting down statefulset controller")
 
 	if !cache.WaitForNamedCacheSync("stateful set", stopCh, ssc.podListerSynced, ssc.setListerSynced, ssc.pvcListerSynced, ssc.revListerSynced) {
 		return
@@ -919,7 +925,7 @@ func (ssc *StatefulSetController) addPod(obj interface{}) {
 		if set == nil {
 			return
 		}
-		klog.V(4).Infof("Pod %s created, labels: %+v", pod.Name, pod.Labels)
+		klog.V(4).InfoS("Pod created", "pod", klog.KObj(pod), "labels", pod.Labels)
 		ssc.enqueueStatefulSet(set)
 		return
 	}
@@ -930,7 +936,7 @@ func (ssc *StatefulSetController) addPod(obj interface{}) {
 	if len(sets) == 0 {
 		return
 	}
-	klog.V(4).Infof("Orphan Pod %s created, labels: %+v", pod.Name, pod.Labels)
+	klog.V(4).InfoS("Orphan Pod created", "pod", klog.KObj(pod), "labels", pod.Labels)
 	for _, set := range sets {
 		ssc.enqueueStatefulSet(set)
 	}
@@ -964,7 +970,7 @@ func (ssc *StatefulSetController) updatePod(old, cur interface{}) {
 		if set == nil {
 			return
 		}
-		klog.V(4).Infof("Pod %s updated, objectMeta %+v -> %+v.", curPod.Name, oldPod.ObjectMeta, curPod.ObjectMeta)
+		klog.V(4).InfoS("Pod updated", "pod", klog.KObj(curPod), "oldObjectMeta", oldPod.ObjectMeta, "newObjectMeta", curPod.ObjectMeta)
 		ssc.enqueueStatefulSet(set)
 		return
 	}
@@ -976,7 +982,7 @@ func (ssc *StatefulSetController) updatePod(old, cur interface{}) {
 		if len(sets) == 0 {
 			return
 		}
-		klog.V(4).Infof("Orphan Pod %s updated, objectMeta %+v -> %+v.", curPod.Name, oldPod.ObjectMeta, curPod.ObjectMeta)
+		klog.V(4).InfoS("Orphan Pod updated", "pod", klog.KObj(curPod), "oldObjectMeta", oldPod.ObjectMeta, "newObjectMeta", curPod.ObjectMeta)
 		for _, set := range sets {
 			ssc.enqueueStatefulSet(set)
 		}
@@ -1013,7 +1019,7 @@ func (ssc *StatefulSetController) deletePod(obj interface{}) {
 	if set == nil {
 		return
 	}
-	klog.V(4).Infof("Pod %s/%s deleted through %v.", pod.Namespace, pod.Name, utilruntime.GetCaller())
+	klog.V(4).InfoS("Pod deleted", "pod", klog.KObj(pod), "caller", utilruntime.GetCaller())
 	ssc.enqueueStatefulSet(set)
 }
 

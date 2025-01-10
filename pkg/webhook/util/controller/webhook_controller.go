@@ -22,12 +22,6 @@ import (
 	"sync"
 	"time"
 
-	extclient "github.com/openkruise/kruise/pkg/client"
-	webhookutil "github.com/openkruise/kruise/pkg/webhook/util"
-	"github.com/openkruise/kruise/pkg/webhook/util/configuration"
-	"github.com/openkruise/kruise/pkg/webhook/util/crd"
-	"github.com/openkruise/kruise/pkg/webhook/util/generator"
-	"github.com/openkruise/kruise/pkg/webhook/util/writer"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	v1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
@@ -45,7 +39,16 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
-	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+
+	extclient "github.com/openkruise/kruise/pkg/client"
+	"github.com/openkruise/kruise/pkg/features"
+	utilfeature "github.com/openkruise/kruise/pkg/util/feature"
+	webhooktypes "github.com/openkruise/kruise/pkg/webhook/types"
+	webhookutil "github.com/openkruise/kruise/pkg/webhook/util"
+	"github.com/openkruise/kruise/pkg/webhook/util/configuration"
+	"github.com/openkruise/kruise/pkg/webhook/util/crd"
+	"github.com/openkruise/kruise/pkg/webhook/util/generator"
+	"github.com/openkruise/kruise/pkg/webhook/util/writer"
 )
 
 const (
@@ -69,21 +72,18 @@ func Inited() chan struct{} {
 
 type Controller struct {
 	kubeClient clientset.Interface
-	handlers   map[string]admission.Handler
+	handlers   map[string]webhooktypes.HandlerGetter
 
 	informerFactory informers.SharedInformerFactory
-	//secretLister       corelisters.SecretNamespaceLister
-	//mutatingWCLister   admissionregistrationlisters.MutatingWebhookConfigurationLister
-	//validatingWCLister admissionregistrationlisters.ValidatingWebhookConfigurationLister
-	crdClient   apiextensionsclientset.Interface
-	crdInformer cache.SharedIndexInformer
-	crdLister   apiextensionslisters.CustomResourceDefinitionLister
-	synced      []cache.InformerSynced
+	crdClient       apiextensionsclientset.Interface
+	crdInformer     cache.SharedIndexInformer
+	crdLister       apiextensionslisters.CustomResourceDefinitionLister
+	synced          []cache.InformerSynced
 
 	queue workqueue.RateLimitingInterface
 }
 
-func New(cfg *rest.Config, handlers map[string]admission.Handler) (*Controller, error) {
+func New(cfg *rest.Config, handlers map[string]webhooktypes.HandlerGetter) (*Controller, error) {
 	c := &Controller{
 		kubeClient: extclient.GetGenericClientWithName("webhook-controller").KubeClient,
 		handlers:   handlers,
@@ -94,22 +94,19 @@ func New(cfg *rest.Config, handlers map[string]admission.Handler) (*Controller, 
 
 	secretInformer := coreinformers.New(c.informerFactory, namespace, nil).Secrets()
 	admissionRegistrationInformer := admissionregistrationinformers.New(c.informerFactory, v1.NamespaceAll, nil)
-	//c.secretLister = secretInformer.Lister().Secrets(namespace)
-	//c.mutatingWCLister = admissionRegistrationInformer.MutatingWebhookConfigurations().Lister()
-	//c.validatingWCLister = admissionRegistrationInformer.ValidatingWebhookConfigurations().Lister()
 
 	secretInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			secret := obj.(*v1.Secret)
 			if secret.Name == secretName {
-				klog.Infof("Secret %s added", secretName)
+				klog.InfoS("Secret added", "name", secretName)
 				c.queue.Add("")
 			}
 		},
 		UpdateFunc: func(old, cur interface{}) {
 			secret := cur.(*v1.Secret)
 			if secret.Name == secretName {
-				klog.Infof("Secret %s updated", secretName)
+				klog.InfoS("Secret updated", "name", secretName)
 				c.queue.Add("")
 			}
 		},
@@ -119,14 +116,14 @@ func New(cfg *rest.Config, handlers map[string]admission.Handler) (*Controller, 
 		AddFunc: func(obj interface{}) {
 			conf := obj.(*admissionregistrationv1.MutatingWebhookConfiguration)
 			if conf.Name == mutatingWebhookConfigurationName {
-				klog.Infof("MutatingWebhookConfiguration %s added", mutatingWebhookConfigurationName)
+				klog.InfoS("MutatingWebhookConfiguration added", "name", mutatingWebhookConfigurationName)
 				c.queue.Add("")
 			}
 		},
 		UpdateFunc: func(old, cur interface{}) {
 			conf := cur.(*admissionregistrationv1.MutatingWebhookConfiguration)
 			if conf.Name == mutatingWebhookConfigurationName {
-				klog.Infof("MutatingWebhookConfiguration %s update", mutatingWebhookConfigurationName)
+				klog.InfoS("MutatingWebhookConfiguration update", "name", mutatingWebhookConfigurationName)
 				c.queue.Add("")
 			}
 		},
@@ -136,14 +133,14 @@ func New(cfg *rest.Config, handlers map[string]admission.Handler) (*Controller, 
 		AddFunc: func(obj interface{}) {
 			conf := obj.(*admissionregistrationv1.ValidatingWebhookConfiguration)
 			if conf.Name == validatingWebhookConfigurationName {
-				klog.Infof("ValidatingWebhookConfiguration %s added", validatingWebhookConfigurationName)
+				klog.InfoS("ValidatingWebhookConfiguration added", "name", validatingWebhookConfigurationName)
 				c.queue.Add("")
 			}
 		},
 		UpdateFunc: func(old, cur interface{}) {
 			conf := cur.(*admissionregistrationv1.ValidatingWebhookConfiguration)
 			if conf.Name == validatingWebhookConfigurationName {
-				klog.Infof("ValidatingWebhookConfiguration %s updated", validatingWebhookConfigurationName)
+				klog.InfoS("ValidatingWebhookConfiguration updated", "name", validatingWebhookConfigurationName)
 				c.queue.Add("")
 			}
 		},
@@ -155,14 +152,14 @@ func New(cfg *rest.Config, handlers map[string]admission.Handler) (*Controller, 
 		AddFunc: func(obj interface{}) {
 			crd := obj.(*apiextensionsv1.CustomResourceDefinition)
 			if crd.Spec.Group == "apps.kruise.io" {
-				klog.Infof("CustomResourceDefinition %s added", crd.Name)
+				klog.InfoS("CustomResourceDefinition added", "name", crd.Name)
 				c.queue.Add("")
 			}
 		},
 		UpdateFunc: func(old, cur interface{}) {
 			crd := cur.(*apiextensionsv1.CustomResourceDefinition)
 			if crd.Spec.Group == "apps.kruise.io" {
-				klog.Infof("CustomResourceDefinition %s updated", crd.Name)
+				klog.InfoS("CustomResourceDefinition updated", "name", crd.Name)
 				c.queue.Add("")
 			}
 		},
@@ -183,8 +180,8 @@ func (c *Controller) Start(ctx context.Context) {
 	defer utilruntime.HandleCrash()
 	defer c.queue.ShutDown()
 
-	klog.Infof("Starting webhook-controller")
-	defer klog.Infof("Shutting down webhook-controller")
+	klog.Info("Starting webhook-controller")
+	defer klog.Info("Shutting down webhook-controller")
 
 	c.informerFactory.Start(ctx.Done())
 	go func() {
@@ -198,7 +195,7 @@ func (c *Controller) Start(ctx context.Context) {
 		for c.processNextWorkItem() {
 		}
 	}, time.Second, ctx.Done())
-	klog.Infof("Started webhook-controller")
+	klog.Info("Started webhook-controller")
 
 	<-ctx.Done()
 }
@@ -224,21 +221,26 @@ func (c *Controller) processNextWorkItem() bool {
 }
 
 func (c *Controller) sync() error {
-	klog.Infof("Starting to sync webhook certs and configurations")
+	klog.Info("Starting to sync webhook certs and configurations")
 	defer func() {
-		klog.Infof("Finished to sync webhook certs and configurations")
+		klog.Info("Finished to sync webhook certs and configurations")
 	}()
 
-	var dnsName string
-	var certWriter writer.CertWriter
-	var err error
-
-	if dnsName = webhookutil.GetHost(); len(dnsName) == 0 {
+	dnsName := webhookutil.GetHost()
+	if len(dnsName) == 0 {
 		dnsName = generator.ServiceToCommonName(webhookutil.GetNamespace(), webhookutil.GetServiceName())
 	}
 
+	var certWriter writer.CertWriter
+	var err error
+
 	certWriterType := webhookutil.GetCertWriter()
-	if certWriterType == writer.FsCertWriter || (len(certWriterType) == 0 && len(webhookutil.GetHost()) != 0) {
+	if utilfeature.DefaultFeatureGate.Enabled(features.EnableExternalCerts) {
+		certWriter, err = writer.NewExternalCertWriter(writer.ExternalCertWriterOptions{
+			Clientset: c.kubeClient,
+			Secret:    &types.NamespacedName{Namespace: webhookutil.GetNamespace(), Name: webhookutil.GetSecretName()},
+		})
+	} else if certWriterType == writer.FsCertWriter || (len(certWriterType) == 0 && len(webhookutil.GetHost()) != 0) {
 		certWriter, err = writer.NewFSCertWriter(writer.FSCertWriterOptions{
 			Path: webhookutil.GetCertDir(),
 		})
@@ -259,7 +261,6 @@ func (c *Controller) sync() error {
 	if err := writer.WriteCertsToDir(webhookutil.GetCertDir(), certs); err != nil {
 		return fmt.Errorf("failed to write certs to dir: %v", err)
 	}
-
 	if err := configuration.Ensure(c.kubeClient, c.handlers, certs.CACert); err != nil {
 		return fmt.Errorf("failed to ensure configuration: %v", err)
 	}

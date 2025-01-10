@@ -1,11 +1,29 @@
-
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingWebhookConfiguration
 metadata:
-  creationTimestamp: null
   name: mutating-webhook-configuration
 webhooks:
+- admissionReviewVersions:
+  - v1
+  - v1beta1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /mutate-pod
+  failurePolicy: Fail
+  name: mpod.kb.io
+  rules:
+  - apiGroups:
+    - ""
+    apiVersions:
+    - v1
+    operations:
+    - CREATE
+    resources:
+    - pods
+  sideEffects: None
 - admissionReviewVersions:
   - v1
   - v1beta1
@@ -118,6 +136,27 @@ webhooks:
     service:
       name: webhook-service
       namespace: system
+      path: /mutate-apps-kruise-io-v1alpha1-imagelistpulljob
+  failurePolicy: Fail
+  name: mimagelistpulljob.kb.io
+  rules:
+  - apiGroups:
+    - apps.kruise.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - imagelistpulljobs
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  - v1beta1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
       path: /mutate-apps-kruise-io-v1alpha1-imagepulljob
   failurePolicy: Fail
   name: mimagepulljob.kb.io
@@ -152,26 +191,6 @@ webhooks:
     - UPDATE
     resources:
     - nodeimages
-  sideEffects: None
-- admissionReviewVersions:
-  - v1
-  - v1beta1
-  clientConfig:
-    service:
-      name: webhook-service
-      namespace: system
-      path: /mutate-pod
-  failurePolicy: Fail
-  name: mpod.kb.io
-  rules:
-  - apiGroups:
-    - ""
-    apiVersions:
-    - v1
-    operations:
-    - CREATE
-    resources:
-    - pods
   sideEffects: None
 - admissionReviewVersions:
   - v1
@@ -237,12 +256,10 @@ webhooks:
     resources:
     - uniteddeployments
   sideEffects: None
-
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingWebhookConfiguration
 metadata:
-  creationTimestamp: null
   name: validating-webhook-configuration
 webhooks:
 - admissionReviewVersions:
@@ -460,6 +477,48 @@ webhooks:
     service:
       name: webhook-service
       namespace: system
+      path: /validate-apps-kruise-io-v1alpha1-ephemeraljob
+  failurePolicy: Fail
+  name: vephemeraljobs.kb.io
+  rules:
+  - apiGroups:
+    - apps.kruise.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - ephemeraljobs
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  - v1beta1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-apps-kruise-io-v1alpha1-imagelistpulljob
+  failurePolicy: Fail
+  name: vimagelistpulljob.kb.io
+  rules:
+  - apiGroups:
+    - apps.kruise.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - imagelistpulljobs
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  - v1beta1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
       path: /validate-apps-kruise-io-v1alpha1-imagepulljob
   failurePolicy: Fail
   name: vimagepulljob.kb.io
@@ -473,6 +532,27 @@ webhooks:
     - UPDATE
     resources:
     - imagepulljobs
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  - v1beta1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-ingress
+  failurePolicy: Fail
+  name: vingress.kb.io
+  rules:
+  - apiGroups:
+    - networking.k8s.io
+    apiVersions:
+    - v1
+    - v1beta1
+    operations:
+    - DELETE
+    resources:
+    - ingresses
   sideEffects: None
 - admissionReviewVersions:
   - v1
@@ -522,6 +602,27 @@ webhooks:
     service:
       name: webhook-service
       namespace: system
+      path: /validate-apps-kruise-io-persistentpodstate
+  failurePolicy: Fail
+  name: vpersistentpodstate.kb.io
+  rules:
+  - apiGroups:
+    - apps.kruise.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - persistentpodstates
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  - v1beta1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
       path: /validate-pod
   failurePolicy: Fail
   name: vpod.kb.io
@@ -563,6 +664,27 @@ webhooks:
     service:
       name: webhook-service
       namespace: system
+      path: /validate-apps-kruise-io-podprobemarker
+  failurePolicy: Fail
+  name: vpodprobemarker.kb.io
+  rules:
+  - apiGroups:
+    - apps.kruise.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - podprobemarkers
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  - v1beta1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
       path: /validate-policy-kruise-io-podunavailablebudget
   failurePolicy: Fail
   name: vpodunavailablebudget.kb.io
@@ -576,6 +698,26 @@ webhooks:
     - UPDATE
     resources:
     - podunavailablebudgets
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  - v1beta1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-service
+  failurePolicy: Fail
+  name: vservice.kb.io
+  rules:
+  - apiGroups:
+    - ""
+    apiVersions:
+    - v1
+    operations:
+    - DELETE
+    resources:
+    - services
   sideEffects: None
 - admissionReviewVersions:
   - v1

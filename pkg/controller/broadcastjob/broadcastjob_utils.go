@@ -25,7 +25,6 @@ import (
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
-	"k8s.io/kubernetes/pkg/apis/core"
 )
 
 // IsJobFinished returns true when finishing job
@@ -57,8 +56,8 @@ func filterPods(restartLimit int32, pods []*v1.Pod) ([]*v1.Pod, []*v1.Pod, []*v1
 				activePods = append(activePods, p)
 			}
 		} else {
-			klog.V(4).Infof("Ignoring inactive pod %v/%v in state %v, deletion time %v",
-				p.Namespace, p.Name, p.Status.Phase, p.DeletionTimestamp)
+			klog.V(4).InfoS("Ignoring inactive pod, deletion scheduled",
+				"pod", klog.KObj(p), "phase", p.Status.Phase, "deletionTimestamp", p.DeletionTimestamp)
 		}
 	}
 	return activePods, failedPods, succeededPods
@@ -134,10 +133,10 @@ func validateControllerRef(controllerRef *metav1.OwnerReference) error {
 	if len(controllerRef.Kind) == 0 {
 		return fmt.Errorf("controllerRef has empty Kind")
 	}
-	if controllerRef.Controller == nil || *controllerRef.Controller != true {
+	if controllerRef.Controller == nil || !*controllerRef.Controller {
 		return fmt.Errorf("controllerRef.Controller is not set to true")
 	}
-	if controllerRef.BlockOwnerDeletion == nil || *controllerRef.BlockOwnerDeletion != true {
+	if controllerRef.BlockOwnerDeletion == nil || !*controllerRef.BlockOwnerDeletion {
 		return fmt.Errorf("controllerRef.BlockOwnerDeletion is not set")
 	}
 	return nil
@@ -153,12 +152,12 @@ func getAssignedNode(pod *v1.Pod) string {
 		terms := pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
 		for _, t := range terms {
 			for _, req := range t.MatchFields {
-				if req.Key == core.ObjectNameField && req.Operator == v1.NodeSelectorOpIn && len(req.Values) == 1 {
+				if req.Key == metav1.ObjectNameField && req.Operator == v1.NodeSelectorOpIn && len(req.Values) == 1 {
 					return req.Values[0]
 				}
 			}
 		}
 	}
-	klog.Warningf("Not found assigned node in Pod %s/%s", pod.Namespace, pod.Name)
+	klog.InfoS("Could not find assigned node in Pod", "pod", klog.KObj(pod))
 	return ""
 }

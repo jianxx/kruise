@@ -18,6 +18,7 @@ package imagepuller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -74,14 +75,14 @@ func newRealPuller(runtime runtimeimage.ImageService, secretManager daemonutil.S
 
 // Sync all images to pull
 func (p *realPuller) Sync(obj *appsv1alpha1.NodeImage, ref *v1.ObjectReference) error {
-	klog.V(5).Infof("sync puller for spec %v", util.DumpJSON(obj))
+	klog.V(5).InfoS("sync puller", "spec", util.DumpJSON(obj))
 
 	p.Lock()
 	defer p.Unlock()
 	// stop all workers not in the spec
 	for imageName := range p.workerPools {
 		if _, ok := obj.Spec.Images[imageName]; !ok {
-			klog.V(3).Infof("stop workerpool for %v", imageName)
+			klog.V(3).InfoS("stop workerpool", "imageName", imageName)
 			pool := p.workerPools[imageName]
 			delete(p.workerPools, imageName)
 			pool.Stop()
@@ -91,7 +92,7 @@ func (p *realPuller) Sync(obj *appsv1alpha1.NodeImage, ref *v1.ObjectReference) 
 	for imageName, imageSpec := range obj.Spec.Images {
 		pool, ok := p.workerPools[imageName]
 		if !ok {
-			klog.V(3).Infof("starting new workerpool for %v", imageName)
+			klog.V(3).InfoS("starting new workerpool", "imageName", imageName)
 			pool = newRealWorkerPool(imageName, p.runtime, p.secretManager, p.eventRecorder)
 			p.workerPools[imageName] = pool
 		}
@@ -155,15 +156,15 @@ func newRealWorkerPool(name string, runtime runtimeimage.ImageService, secretMan
 
 func (w *realWorkerPool) Sync(spec *appsv1alpha1.ImageSpec, status *appsv1alpha1.ImageStatus, ref *v1.ObjectReference) error {
 	if !w.active {
-		klog.Infof("workerPool %v has exited", w.name)
+		klog.InfoS("workerPool has exited", "name", w.name)
 		return nil
 	}
 
-	klog.V(5).Infof("sync worker pool for %v", w.name)
+	klog.V(5).InfoS("sync worker pool", "name", w.name)
 
 	secrets, err := w.secretManager.GetSecrets(spec.PullSecrets)
 	if err != nil {
-		klog.Warningf("failed to get secrets %v, err %v", spec.PullSecrets, err)
+		klog.ErrorS(err, "failed to get secrets", "pullSecrets", spec.PullSecrets)
 		return err
 	}
 
@@ -194,11 +195,11 @@ func (w *realWorkerPool) Sync(spec *appsv1alpha1.ImageSpec, status *appsv1alpha1
 	for tag, worker := range w.pullWorkers {
 		tagSpec, ok := activeTags[tag]
 		if !ok {
-			klog.V(4).Infof("stopping worker %v which is not in spec", worker.ImageRef())
+			klog.V(4).InfoS("stopping worker which is not in spec", "imageRef", worker.ImageRef())
 			delete(w.pullWorkers, tag)
 			worker.Stop()
 		} else if tagSpec.Version != worker.tagSpec.Version {
-			klog.V(4).Infof("stopping worker %v which is old version %v -> %v", worker.ImageRef(), worker.tagSpec.Version, tagSpec.Version)
+			klog.V(4).InfoS("stopping worker with old version", "imageRef", worker.ImageRef(), "old", worker.tagSpec.Version, "new", tagSpec.Version)
 			delete(w.pullWorkers, tag)
 			worker.Stop()
 		}
@@ -214,7 +215,7 @@ func (w *realWorkerPool) Sync(spec *appsv1alpha1.ImageSpec, status *appsv1alpha1
 		_, ok := w.pullWorkers[tagSpec.Tag]
 
 		if !ok {
-			worker := newPullWorker(w.name, tagSpec, secrets, w.runtime, w, ref, w.eventRecorder)
+			worker := newPullWorker(w.name, tagSpec, spec.SandboxConfig, secrets, w.runtime, w, ref, w.eventRecorder)
 			w.pullWorkers[tagSpec.Tag] = worker
 		}
 	}
@@ -262,10 +263,11 @@ func (w *realWorkerPool) UpdateStatus(status *appsv1alpha1.ImageTagStatus) {
 	w.tagStatuses[status.Tag] = status
 }
 
-func newPullWorker(name string, tagSpec appsv1alpha1.ImageTagSpec, secrets []v1.Secret, runtime runtimeimage.ImageService, statusUpdater imageStatusUpdater, ref *v1.ObjectReference, eventRecorder record.EventRecorder) *pullWorker {
+func newPullWorker(name string, tagSpec appsv1alpha1.ImageTagSpec, sandboxConfig *appsv1alpha1.SandboxConfig, secrets []v1.Secret, runtime runtimeimage.ImageService, statusUpdater imageStatusUpdater, ref *v1.ObjectReference, eventRecorder record.EventRecorder) *pullWorker {
 	o := &pullWorker{
 		name:          name,
 		tagSpec:       tagSpec,
+		sandboxConfig: sandboxConfig,
 		secrets:       secrets,
 		runtime:       runtime,
 		statusUpdater: statusUpdater,
@@ -283,6 +285,7 @@ type pullWorker struct {
 
 	name          string
 	tagSpec       appsv1alpha1.ImageTagSpec
+	sandboxConfig *appsv1alpha1.SandboxConfig
 	secrets       []v1.Secret
 	runtime       runtimeimage.ImageService
 	statusUpdater imageStatusUpdater
@@ -301,7 +304,7 @@ func (w *pullWorker) Stop() {
 	w.Lock()
 	defer w.Unlock()
 	if w.active {
-		klog.Warningf("Worker to pull image %s:%s is stopped", w.name, w.tagSpec.Tag)
+		klog.InfoS("Worker to pull image is stopped", "name", w.name, "tag", w.tagSpec.Tag)
 		w.active = false
 		close(w.stopCh)
 	}
@@ -312,7 +315,7 @@ func (w *pullWorker) IsActive() bool {
 }
 
 func (w *pullWorker) Run() {
-	klog.V(3).Infof("starting worker %v version %v", w.ImageRef(), w.tagSpec.Version)
+	klog.V(3).InfoS("starting worker", "image", w.ImageRef(), "version", w.tagSpec.Version)
 
 	tag := w.tagSpec.Tag
 	startTime := metav1.Now()
@@ -322,12 +325,19 @@ func (w *pullWorker) Run() {
 		StartTime: &startTime,
 		Version:   w.tagSpec.Version,
 	}
+
+	// We should update the image status when we start pulling images,
+	// which can meet the scenario that some large size images cannot return the result from CRI.PullImage within 60s. For one reason:
+	// For nodeimage controller will mark image:tag task failed (not responded for a long time) if daemon does not report status in 60s.
+	// Ref: https://github.com/openkruise/kruise/issues/1273
+	w.statusUpdater.UpdateStatus(newStatus)
+
 	defer func() {
 		cost := time.Since(startTime.Time)
 		if newStatus.Phase == appsv1alpha1.ImagePhaseFailed {
-			klog.Warningf("Worker failed to pull image %s:%s, cost %v, err: %v", w.name, tag, cost, newStatus.Message)
+			klog.ErrorS(errors.New(newStatus.Message), "Worker failed to pull image", "name", w.name, "tag", tag, "cost", cost)
 		} else {
-			klog.Infof("Successfully pull image %s:%s, cost %vs", w.name, tag, cost)
+			klog.InfoS("Successfully pull image", "name", w.name, "tag", tag, "cost", cost)
 		}
 		if w.IsActive() {
 			w.statusUpdater.UpdateStatus(newStatus)
@@ -369,14 +379,14 @@ func (w *pullWorker) Run() {
 		}
 
 		pullContext, cancel := context.WithTimeout(context.Background(), onceTimeout)
-		lastError = w.doPullImage(pullContext, newStatus)
+		lastError = w.doPullImage(pullContext, newStatus, w.tagSpec.ImagePullPolicy)
 		if lastError != nil {
 			cancel()
 			if !w.IsActive() {
 				break
 			}
 
-			klog.Warningf("Pulling image %s:%s backoff %d, error %v", w.name, tag, i+1, lastError)
+			klog.ErrorS(lastError, "Pulling image backoff", "name", w.name, "tag", tag, "backoff", i+1)
 			time.Sleep(step)
 			step = minDuration(2*step, maxBackoff)
 			continue
@@ -407,7 +417,7 @@ func (w *pullWorker) Run() {
 func (w *pullWorker) getImageInfo(ctx context.Context) (*runtimeimage.ImageInfo, error) {
 	imageInfos, err := w.runtime.ListImages(ctx)
 	if err != nil {
-		klog.V(5).Infof("List images failed, err %v", err)
+		klog.V(5).ErrorS(err, "List images failed")
 		return nil, err
 	}
 	for _, info := range imageInfos {
@@ -419,21 +429,48 @@ func (w *pullWorker) getImageInfo(ctx context.Context) (*runtimeimage.ImageInfo,
 }
 
 // Pulling image and update process in status
-func (w *pullWorker) doPullImage(ctx context.Context, newStatus *appsv1alpha1.ImageTagStatus) (err error) {
+func (w *pullWorker) doPullImage(ctx context.Context, newStatus *appsv1alpha1.ImageTagStatus, imagePullPolicy appsv1alpha1.ImagePullPolicy) (err error) {
 	tag := w.tagSpec.Tag
 	startTime := metav1.Now()
 
-	klog.Infof("Worker is starting to pull image %s:%s version %v", w.name, tag, w.tagSpec.Version)
+	klog.InfoS("Worker is starting to pull image", "name", w.name, "tag", tag, "version", w.tagSpec.Version)
 
-	if _, e := w.getImageInfo(ctx); e == nil {
-		klog.Infof("Image %s:%s is already exists", w.name, tag)
+	if info, _ := w.getImageInfo(ctx); info != nil && imagePullPolicy == appsv1alpha1.PullIfNotPresent {
+		klog.InfoS("Image is already exists", "name", w.name, "tag", tag)
 		newStatus.Progress = 100
 		return nil
 	}
 
-	statusReader, err := w.runtime.PullImage(ctx, w.name, tag, w.secrets)
-	if err != nil {
-		return err
+	// make it asynchronous for CRI runtime will block in pulling image
+	var statusReader runtimeimage.ImagePullStatusReader
+	pullChan := make(chan struct{})
+	go func() {
+		statusReader, err = w.runtime.PullImage(ctx, w.name, tag, w.secrets, w.sandboxConfig)
+		close(pullChan)
+	}()
+
+	closeStatusReader := func() {
+		select {
+		case <-pullChan:
+		}
+		if statusReader != nil {
+			statusReader.Close()
+		}
+	}
+
+	select {
+	case <-w.stopCh:
+		go closeStatusReader()
+		klog.V(2).InfoS("Pulling image stopped", "name", w.name, "tag", tag)
+		return fmt.Errorf("pulling image %s:%s is stopped", w.name, tag)
+	case <-ctx.Done():
+		go closeStatusReader()
+		klog.V(2).InfoS("Pulling image canceled", "name", w.name, "tag", tag)
+		return fmt.Errorf("pulling image %s:%s is canceled", w.name, tag)
+	case <-pullChan:
+		if err != nil {
+			return err
+		}
 	}
 	defer statusReader.Close()
 
@@ -445,13 +482,13 @@ func (w *pullWorker) doPullImage(ctx context.Context, newStatus *appsv1alpha1.Im
 	for {
 		select {
 		case <-w.stopCh:
-			klog.V(2).Infof("Pulling image %v:%v is stopped.", w.name, tag)
+			klog.V(2).InfoS("Pulling image stopped", "name", w.name, "tag", tag)
 			return fmt.Errorf("pulling image %s:%s is stopped", w.name, tag)
 		case <-ctx.Done():
-			klog.V(2).Infof("Pulling image %s:%s is canceled", w.name, tag)
+			klog.V(2).InfoS("Pulling image canceled", w.name, tag)
 			return fmt.Errorf("pulling image %s:%s is canceled", w.name, tag)
 		case <-logTicker.C:
-			klog.V(2).Infof("Pulling image %s:%s, cost: %v, progress: %v%%, detail: %v", w.name, tag, time.Since(startTime.Time), progress, progressInfo)
+			klog.V(2).InfoS("Pulling image", "name", w.name, "tag", tag, "cost", time.Since(startTime.Time), "progress", progress, "detail", progressInfo)
 		case progressStatus, ok := <-statusReader.C():
 			if !ok {
 				return fmt.Errorf("pulling image %s:%s internal error", w.name, tag)
@@ -459,7 +496,7 @@ func (w *pullWorker) doPullImage(ctx context.Context, newStatus *appsv1alpha1.Im
 			progress = progressStatus.Process
 			progressInfo = progressStatus.DetailInfo
 			newStatus.Progress = int32(progressStatus.Process)
-			klog.V(5).Infof("Pulling image %s:%s, cost: %v, progress: %v%%, detail: %v", w.name, tag, time.Since(startTime.Time), progress, progressInfo)
+			klog.V(5).InfoS("Pulling image", "name", w.name, "tag", tag, "cost", time.Since(startTime.Time), "progress", progress, "detail", progressInfo)
 			if progressStatus.Finish {
 				if progressStatus.Err == nil {
 					return nil

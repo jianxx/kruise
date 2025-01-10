@@ -20,15 +20,13 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"reflect"
-
-	"github.com/openkruise/kruise/pkg/features"
-	utilfeature "github.com/openkruise/kruise/pkg/util/feature"
 
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/runtime/inject"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+
+	"github.com/openkruise/kruise/pkg/features"
+	utilfeature "github.com/openkruise/kruise/pkg/util/feature"
 )
 
 // PodCreateHandler handles Pod
@@ -53,54 +51,74 @@ func (h *PodCreateHandler) Handle(ctx context.Context, req admission.Request) ad
 	if err != nil {
 		return admission.Errored(http.StatusBadRequest, err)
 	}
-	clone := obj.DeepCopy()
 	// when pod.namespace is empty, using req.namespace
 	if obj.Namespace == "" {
 		obj.Namespace = req.Namespace
 	}
+	oriObj := obj.DeepCopy()
+	var changed bool
 
-	injectPodReadinessGate(req, obj)
+	if skip := injectPodReadinessGate(req, obj); !skip {
+		changed = true
+	}
 
 	if utilfeature.DefaultFeatureGate.Enabled(features.WorkloadSpread) {
-		err = h.workloadSpreadMutatingPod(ctx, req, obj)
-		if err != nil {
+		if skip, err := h.workloadSpreadMutatingPod(ctx, req, obj); err != nil {
 			return admission.Errored(http.StatusInternalServerError, err)
+		} else if !skip {
+			changed = true
 		}
 	}
 
-	err = h.sidecarsetMutatingPod(ctx, req, obj)
-	if err != nil {
+	if skip, err := h.sidecarsetMutatingPod(ctx, req, obj); err != nil {
 		return admission.Errored(http.StatusInternalServerError, err)
+	} else if !skip {
+		changed = true
 	}
 
 	// "the order matters and sidecarsetMutatingPod must precede containerLaunchPriorityInitialization"
-	err = h.containerLaunchPriorityInitialization(ctx, req, obj)
-	if err != nil {
+	if skip, err := h.containerLaunchPriorityInitialization(ctx, req, obj); err != nil {
 		return admission.Errored(http.StatusInternalServerError, err)
+	} else if !skip {
+		changed = true
 	}
 
-	if reflect.DeepEqual(obj, clone) {
+	// patch related-pub annotation in pod
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodUnavailableBudgetUpdateGate) ||
+		utilfeature.DefaultFeatureGate.Enabled(features.PodUnavailableBudgetDeleteGate) {
+		if skip, err := h.pubMutatingPod(ctx, req, obj); err != nil {
+			return admission.Errored(http.StatusInternalServerError, err)
+		} else if !skip {
+			changed = true
+		}
+	}
+
+	// persistent pod state
+	if skip, err := h.persistentPodStateMutatingPod(ctx, req, obj); err != nil {
+		return admission.Errored(http.StatusInternalServerError, err)
+	} else if !skip {
+		changed = true
+	}
+
+	// EnhancedLivenessProbe enabled
+	if utilfeature.DefaultFeatureGate.Enabled(features.EnhancedLivenessProbeGate) {
+		if skip, err := h.enhancedLivenessProbeWhenPodCreate(ctx, req, obj); err != nil {
+			return admission.Errored(http.StatusInternalServerError, err)
+		} else if !skip {
+			changed = true
+		}
+	}
+
+	if !changed {
 		return admission.Allowed("")
 	}
 	marshalled, err := json.Marshal(obj)
 	if err != nil {
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
-	return admission.PatchResponseFromRaw(req.AdmissionRequest.Object.Raw, marshalled)
-}
-
-var _ inject.Client = &PodCreateHandler{}
-
-// InjectClient injects the client into the PodCreateHandler
-func (h *PodCreateHandler) InjectClient(c client.Client) error {
-	h.Client = c
-	return nil
-}
-
-var _ admission.DecoderInjector = &PodCreateHandler{}
-
-// InjectDecoder injects the decoder into the PodCreateHandler
-func (h *PodCreateHandler) InjectDecoder(d *admission.Decoder) error {
-	h.Decoder = d
-	return nil
+	original, err := json.Marshal(oriObj)
+	if err != nil {
+		return admission.Errored(http.StatusInternalServerError, err)
+	}
+	return admission.PatchResponseFromRaw(original, marshalled)
 }

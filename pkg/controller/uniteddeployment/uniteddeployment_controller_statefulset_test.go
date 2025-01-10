@@ -17,6 +17,8 @@ limitations under the License.
 package uniteddeployment
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"sync"
@@ -24,19 +26,21 @@ import (
 	"time"
 
 	"github.com/onsi/gomega"
-	"golang.org/x/net/context"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
+	appsv1beta1 "github.com/openkruise/kruise/apis/apps/v1beta1"
 	kruisectlutil "github.com/openkruise/kruise/pkg/controller/util"
-	"github.com/openkruise/kruise/pkg/util"
+	utilclient "github.com/openkruise/kruise/pkg/util/client"
 )
 
 var c client.Client
@@ -326,6 +330,210 @@ func TestStsSubsetProvision(t *testing.T) {
 	g.Expect(sts.Spec.Template.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[1].MatchExpressions[1].Operator).Should(gomega.BeEquivalentTo(corev1.NodeSelectorOpIn))
 	g.Expect(len(sts.Spec.Template.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[1].MatchExpressions[1].Values)).Should(gomega.BeEquivalentTo(1))
 	g.Expect(sts.Spec.Template.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[1].MatchExpressions[1].Values[0]).Should(gomega.BeEquivalentTo("node-b"))
+}
+
+func TestStsSubsetPatch(t *testing.T) {
+	g, requests, cancel, mgrStopped := setUp(t)
+	defer func() {
+		clean(g, c)
+		cancel()
+		mgrStopped.Wait()
+	}()
+
+	caseName := "test-sts-subset-patch"
+
+	imagePatch := map[string]interface{}{
+		"spec": map[string]interface{}{
+			"containers": []map[string]interface{}{
+				{
+					"name":  "container-a",
+					"image": "nginx:2.0",
+				},
+			},
+		},
+	}
+	labelPatch := map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"labels": map[string]string{
+				"zone": "a",
+			},
+		},
+	}
+	resourcePatch := map[string]interface{}{
+		"spec": map[string]interface{}{
+			"containers": []map[string]interface{}{
+				{
+					"name": "container-a",
+					"resources": map[string]interface{}{
+						"limits": map[string]interface{}{
+							"cpu":    "2",
+							"memory": "800Mi",
+						},
+					},
+				},
+			},
+		},
+	}
+	envPatch := map[string]interface{}{
+		"spec": map[string]interface{}{
+			"containers": []map[string]interface{}{
+				{
+					"name": "container-a",
+					"env": []map[string]string{
+						{
+							"name":  "K8S_CONTAINER_NAME",
+							"value": "main",
+						},
+					},
+				},
+			},
+		},
+	}
+	labelPatchBytes, _ := json.Marshal(labelPatch)
+	imagePatchBytes, _ := json.Marshal(imagePatch)
+	resourcePatchBytes, _ := json.Marshal(resourcePatch)
+	envPatchBytes, _ := json.Marshal(envPatch)
+	instance := &appsv1alpha1.UnitedDeployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      caseName,
+			Namespace: "default",
+		},
+		Spec: appsv1alpha1.UnitedDeploymentSpec{
+			Replicas: &one,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"name": caseName,
+				},
+			},
+			Template: appsv1alpha1.SubsetTemplate{
+				StatefulSetTemplate: &appsv1alpha1.StatefulSetTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{
+							"name": caseName,
+						},
+					},
+					Spec: appsv1.StatefulSetSpec{
+						Template: corev1.PodTemplateSpec{
+							ObjectMeta: metav1.ObjectMeta{
+								Labels: map[string]string{
+									"name": caseName,
+								},
+							},
+							Spec: corev1.PodSpec{
+								Containers: []corev1.Container{
+									{
+										Name:  "container-a",
+										Image: "nginx:1.0",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			Topology: appsv1alpha1.Topology{
+				Subsets: []appsv1alpha1.Subset{
+					{
+						Name: "subset-a",
+						Patch: runtime.RawExtension{
+							Raw: imagePatchBytes,
+						},
+						NodeSelectorTerm: corev1.NodeSelectorTerm{
+							MatchExpressions: []corev1.NodeSelectorRequirement{
+								{
+									Key:      "node-name",
+									Operator: corev1.NodeSelectorOpIn,
+									Values:   []string{"node-a"},
+								},
+							},
+						},
+					},
+					{
+						Name: "subset-b",
+						Patch: runtime.RawExtension{
+							Raw: labelPatchBytes,
+						},
+						NodeSelectorTerm: corev1.NodeSelectorTerm{
+							MatchExpressions: []corev1.NodeSelectorRequirement{
+								{
+									Key:      "node-name",
+									Operator: corev1.NodeSelectorOpIn,
+									Values:   []string{"node-b"},
+								},
+							},
+						},
+					},
+					{
+						Name: "subset-c",
+						Patch: runtime.RawExtension{
+							Raw: resourcePatchBytes,
+						},
+						NodeSelectorTerm: corev1.NodeSelectorTerm{
+							MatchExpressions: []corev1.NodeSelectorRequirement{
+								{
+									Key:      "node-name",
+									Operator: corev1.NodeSelectorOpIn,
+									Values:   []string{"node-c"},
+								},
+							},
+						},
+					},
+					{
+						Name: "subset-d",
+						Patch: runtime.RawExtension{
+							Raw: envPatchBytes,
+						},
+						NodeSelectorTerm: corev1.NodeSelectorTerm{
+							MatchExpressions: []corev1.NodeSelectorRequirement{
+								{
+									Key:      "node-name",
+									Operator: corev1.NodeSelectorOpIn,
+									Values:   []string{"node-d"},
+								},
+							},
+						},
+					},
+				},
+			},
+			RevisionHistoryLimit: &ten,
+		},
+	}
+
+	// Create the UnitedDeployment object and expect the Reconcile and Deployment to be created
+	err := c.Create(context.TODO(), instance)
+	// The instance object may not be a valid object because it might be missing some required fields.
+	// Please modify the instance object by adding required fields and then remove the following if statement.
+	if apierrors.IsInvalid(err) {
+		t.Logf("failed to create object, got an invalid object error: %v", err)
+		return
+	}
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	defer c.Delete(context.TODO(), instance)
+	waitReconcilerProcessFinished(g, requests, 3)
+
+	stsList := expectedStsCount(g, instance, 4)
+	sts := getSubsetByName(stsList, "subset-a")
+	g.Expect(sts.Spec).ShouldNot(gomega.BeNil())
+	g.Expect(sts.Spec.Template.Spec.Containers[0].Image).Should(gomega.BeEquivalentTo("nginx:2.0"))
+
+	sts = getSubsetByName(stsList, "subset-b")
+	g.Expect(sts.Spec).ShouldNot(gomega.BeNil())
+	g.Expect(sts.Spec.Template.Labels).Should(gomega.HaveKeyWithValue("zone", "a"))
+
+	sts = getSubsetByName(stsList, "subset-c")
+	g.Expect(sts.Spec).ShouldNot(gomega.BeNil())
+	g.Expect(sts.Spec.Template.Spec.Containers[0].Resources).ShouldNot(gomega.BeNil())
+	g.Expect(sts.Spec.Template.Spec.Containers[0].Resources.Limits).ShouldNot(gomega.BeNil())
+	g.Expect(sts.Spec.Template.Spec.Containers[0].Resources.Limits.Cpu()).ShouldNot(gomega.BeNil())
+	g.Expect(sts.Spec.Template.Spec.Containers[0].Resources.Limits.Cpu().Value()).Should(gomega.BeEquivalentTo(2))
+	g.Expect(sts.Spec.Template.Spec.Containers[0].Resources.Limits.Memory()).ShouldNot(gomega.BeNil())
+	g.Expect(sts.Spec.Template.Spec.Containers[0].Resources.Limits.Memory().String()).Should(gomega.BeEquivalentTo("800Mi"))
+
+	sts = getSubsetByName(stsList, "subset-d")
+	g.Expect(sts.Spec).ShouldNot(gomega.BeNil())
+	g.Expect(sts.Spec.Template.Spec.Containers[0].Env).ShouldNot(gomega.BeNil())
+	g.Expect(sts.Spec.Template.Spec.Containers[0].Env[0].Name).Should(gomega.BeEquivalentTo("K8S_CONTAINER_NAME"))
+	g.Expect(sts.Spec.Template.Spec.Containers[0].Env[0].Value).Should(gomega.BeEquivalentTo("main"))
 }
 
 func TestStsSubsetProvisionWithToleration(t *testing.T) {
@@ -1607,9 +1815,9 @@ func setUp(t *testing.T) (*gomega.GomegaWithT, chan reconcile.Request, context.C
 	g := gomega.NewGomegaWithT(t)
 	// Setup the Manager and Controller.  Wrap the Controller Reconcile function so it writes each request to a
 	// channel when it is finished.
-	mgr, err := manager.New(cfg, manager.Options{MetricsBindAddress: "0"})
+	mgr, err := manager.New(cfg, manager.Options{Metrics: metricsserver.Options{BindAddress: "0"}})
 	g.Expect(err).NotTo(gomega.HaveOccurred())
-	c = util.NewClientFromManager(mgr, "test-uniteddeployment-controller")
+	c = utilclient.NewClientFromManager(mgr, "test-uniteddeployment-controller")
 	recFn, requests := SetupTestReconcile(newReconciler(mgr))
 	g.Expect(add(mgr, recFn)).NotTo(gomega.HaveOccurred())
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1674,7 +1882,7 @@ func clean(g *gomega.GomegaWithT, c client.Client) {
 		return nil
 	}, timeout, time.Second).Should(gomega.Succeed())
 
-	astsList := &appsv1alpha1.StatefulSetList{}
+	astsList := &appsv1beta1.StatefulSetList{}
 	if err := c.List(context.TODO(), astsList); err == nil {
 		for _, asts := range astsList.Items {
 			c.Delete(context.TODO(), &asts)

@@ -4,13 +4,14 @@ import (
 	"fmt"
 	"time"
 
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/klog/v2"
 
 	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
 	"github.com/openkruise/kruise/pkg/controller/ephemeraljob/econtainer"
-	v1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
+	"github.com/openkruise/kruise/pkg/util"
 )
 
 // pastActiveDeadline checks if job has ActiveDeadlineSeconds field set and if it is exceeded.
@@ -29,7 +30,7 @@ func podMatchedEphemeralJob(pod *v1.Pod, ejob *appsv1alpha1.EphemeralJob) (bool,
 	if pod.Namespace != ejob.Namespace {
 		return false, nil
 	}
-	selector, err := metav1.LabelSelectorAsSelector(ejob.Spec.Selector)
+	selector, err := util.ValidatedLabelSelectorAsSelector(ejob.Spec.Selector)
 	if err != nil {
 		return false, err
 	}
@@ -90,17 +91,6 @@ func getPodEphemeralContainers(pod *v1.Pod, ejob *appsv1alpha1.EphemeralJob) []s
 		podEphemeralNames[i] = pod.Name + "-" + eContainers[i].Name
 	}
 	return podEphemeralNames
-}
-
-func existEphemeralContainer(job *appsv1alpha1.EphemeralJob, targetPod *v1.Pod) bool {
-	ephemeralContainersMaps, _ := getEphemeralContainersMaps(econtainer.New(job).GetEphemeralContainers(targetPod))
-	for _, e := range job.Spec.Template.EphemeralContainers {
-		if targetEC, ok := ephemeralContainersMaps[e.Name]; ok && isCreatedByEJob(string(job.UID), targetEC) {
-			return true
-		}
-	}
-
-	return false
 }
 
 func existDuplicatedEphemeralContainer(job *appsv1alpha1.EphemeralJob, targetPod *v1.Pod) bool {
@@ -179,7 +169,7 @@ func calculateEphemeralContainerStatus(job *appsv1alpha1.EphemeralJob, pods []*v
 func parseEphemeralPodStatus(ejob *appsv1alpha1.EphemeralJob, statuses []v1.ContainerStatus) (v1.PodPhase, error) {
 	eContainerMap, empty := getEphemeralContainersMaps(ejob.Spec.Template.EphemeralContainers)
 	if empty {
-		klog.Error("ephemeral job spec containers is empty")
+		klog.InfoS("EphemeralJob spec containers is empty")
 		return v1.PodUnknown, fmt.Errorf("ephemeral job %s/%s spec containers is empty. ", ejob.Namespace, ejob.Name)
 	}
 
@@ -190,7 +180,7 @@ func parseEphemeralPodStatus(ejob *appsv1alpha1.EphemeralJob, statuses []v1.Cont
 		}
 
 		status := parseEphemeralContainerStatus(&eContainerStatus)
-		klog.V(5).Infof("parse ephemeral container %s status %s", eContainerStatus.Name, status)
+		klog.V(5).InfoS("Parse ephemeral container status", "ephemeralContainerStatusName", eContainerStatus.Name, "status", status)
 		switch status {
 		case FailedStatus:
 			return v1.PodFailed, nil

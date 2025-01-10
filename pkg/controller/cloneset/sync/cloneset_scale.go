@@ -23,6 +23,11 @@ import (
 	"sync"
 	"sync/atomic"
 
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/rand"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/klog/v2"
+
 	appspub "github.com/openkruise/kruise/apis/apps/pub"
 	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
 	clonesetcore "github.com/openkruise/kruise/pkg/controller/cloneset/core"
@@ -30,10 +35,7 @@ import (
 	"github.com/openkruise/kruise/pkg/util"
 	"github.com/openkruise/kruise/pkg/util/expectations"
 	"github.com/openkruise/kruise/pkg/util/lifecycle"
-	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/util/rand"
-	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/klog/v2"
+	"github.com/openkruise/kruise/pkg/util/revision"
 )
 
 const (
@@ -53,10 +55,9 @@ func (r *realControl) Scale(
 		return false, fmt.Errorf("spec.Replicas is nil")
 	}
 
-	controllerKey := clonesetutils.GetControllerKey(updateCS)
 	coreControl := clonesetcore.New(updateCS)
 	if !coreControl.IsReadyToScale() {
-		klog.Warningf("CloneSet %s skip scaling for not ready to scale", controllerKey)
+		klog.InfoS("CloneSet skipped scaling for not ready to scale", "cloneSet", klog.KObj(updateCS))
 		return false, nil
 	}
 
@@ -67,25 +68,22 @@ func (r *realControl) Scale(
 	}
 
 	// 2. calculate scale numbers
-	diffRes := calculateDiffsWithExpectation(updateCS, pods, currentRevision, updateRevision)
-	updatedPods, notUpdatedPods := clonesetutils.SplitPodsByRevision(pods, updateRevision)
+	diffRes := calculateDiffsWithExpectation(updateCS, pods, currentRevision, updateRevision, revision.IsPodUpdate)
+	updatedPods, notUpdatedPods := clonesetutils.GroupUpdateAndNotUpdatePods(pods, updateRevision)
 
-	if diffRes.scaleNum > 0 && diffRes.scaleNum > diffRes.scaleUpLimit {
+	if diffRes.scaleUpNum > diffRes.scaleUpLimit {
 		r.recorder.Event(updateCS, v1.EventTypeWarning, "ScaleUpLimited", fmt.Sprintf("scaleUp is limited because of scaleStrategy.maxUnavailable, limit: %d", diffRes.scaleUpLimit))
 	}
 
 	// 3. scale out
-	if diffRes.scaleNum > 0 && diffRes.scaleUpLimit > 0 {
+	if diffRes.scaleUpNum > 0 {
 		// total number of this creation
 		expectedCreations := diffRes.scaleUpLimit
 		// lack number of current version
-		expectedCurrentCreations := 0
-		if diffRes.scaleNumOldRevision > 0 {
-			expectedCurrentCreations = diffRes.scaleNumOldRevision
-		}
+		expectedCurrentCreations := diffRes.scaleUpNumOldRevision
 
-		klog.V(3).Infof("CloneSet %s begin to scale out %d pods including %d (current rev)",
-			controllerKey, expectedCreations, expectedCurrentCreations)
+		klog.V(3).InfoS("CloneSet began to scale out pods, including current revision",
+			"cloneSet", klog.KObj(updateCS), "expectedCreations", expectedCreations, "expectedCurrentCreations", expectedCurrentCreations)
 
 		// available instance-id come from free pvc
 		availableIDs := getOrGenAvailableIDs(expectedCreations, pods, pvcs)
@@ -101,7 +99,7 @@ func (r *realControl) Scale(
 
 	// 4. try to delete pods already in pre-delete
 	if len(podsInPreDelete) > 0 {
-		klog.V(3).Infof("CloneSet %s try to delete pods in preDelete: %v", controllerKey, util.GetPodNames(podsInPreDelete).List())
+		klog.V(3).InfoS("CloneSet tried to delete pods in preDelete", "cloneSet", klog.KObj(updateCS), "pods", util.GetPodNames(podsInPreDelete).List())
 		if modified, err := r.deletePods(updateCS, podsInPreDelete, pvcs); err != nil || modified {
 			return modified, err
 		}
@@ -109,45 +107,37 @@ func (r *realControl) Scale(
 
 	// 5. specified delete
 	if podsToDelete := util.DiffPods(podsSpecifiedToDelete, podsInPreDelete); len(podsToDelete) > 0 {
-		newPodsToDelete, oldPodsToDelete := clonesetutils.SplitPodsByRevision(podsToDelete, updateRevision)
-		klog.V(3).Infof("CloneSet %s try to delete pods specified. Delete ready limit: %d. Pods: %v, %v.",
-			controllerKey, diffRes.deleteReadyLimit, util.GetPodNames(newPodsToDelete).List(), util.GetPodNames(oldPodsToDelete).List())
+		newPodsToDelete, oldPodsToDelete := clonesetutils.GroupUpdateAndNotUpdatePods(podsToDelete, updateRevision)
+		klog.V(3).InfoS("CloneSet tried to delete pods specified", "cloneSet", klog.KObj(updateCS), "deleteReadyLimit", diffRes.deleteReadyLimit,
+			"newPods", util.GetPodNames(newPodsToDelete).List(), "oldPods", util.GetPodNames(oldPodsToDelete).List())
 
-		podsToDelete = make([]*v1.Pod, 0, len(podsToDelete))
-		for _, pod := range newPodsToDelete {
+		podsCanDelete := make([]*v1.Pod, 0, len(podsToDelete))
+		for _, pod := range podsToDelete {
 			if !isPodReady(coreControl, pod) {
-				podsToDelete = append(podsToDelete, pod)
+				podsCanDelete = append(podsCanDelete, pod)
 			} else if diffRes.deleteReadyLimit > 0 {
-				podsToDelete = append(podsToDelete, pod)
-				diffRes.deleteReadyLimit--
-			}
-		}
-		for _, pod := range oldPodsToDelete {
-			if !isPodReady(coreControl, pod) {
-				podsToDelete = append(podsToDelete, pod)
-			} else if diffRes.deleteReadyLimit > 0 {
-				podsToDelete = append(podsToDelete, pod)
+				podsCanDelete = append(podsCanDelete, pod)
 				diffRes.deleteReadyLimit--
 			}
 		}
 
-		if modified, err := r.deletePods(updateCS, podsToDelete, pvcs); err != nil || modified {
+		if modified, err := r.deletePods(updateCS, podsCanDelete, pvcs); err != nil || modified {
 			return modified, err
 		}
 	}
 
 	// 6. scale in
-	if diffRes.scaleNum < 0 {
+	if diffRes.scaleDownNum > 0 {
 		if numToDelete > 0 {
-			klog.V(3).Infof("CloneSet %s skip to scale in %d for %d to delete, including %d specified and %d preDelete",
-				controllerKey, diffRes.scaleNum, numToDelete, len(podsSpecifiedToDelete), len(podsInPreDelete))
+			klog.V(3).InfoS("CloneSet skipped to scale in for deletion", "cloneSet", klog.KObj(updateCS), "scaleDownNum", diffRes.scaleDownNum,
+				"numToDelete", numToDelete, "specifiedToDelete", len(podsSpecifiedToDelete), "preDelete", len(podsInPreDelete))
 			return false, nil
 		}
 
-		klog.V(3).Infof("CloneSet %s begin to scale in %d pods including %d (current rev), delete ready limit: %d",
-			controllerKey, -diffRes.scaleNum, -diffRes.scaleNumOldRevision, diffRes.deleteReadyLimit)
+		klog.V(3).InfoS("CloneSet began to scale in", "cloneSet", klog.KObj(updateCS), "scaleDownNum", diffRes.scaleDownNum,
+			"oldRevision", diffRes.scaleDownNumOldRevision, "deleteReadyLimit", diffRes.deleteReadyLimit)
 
-		podsPreparingToDelete := r.choosePodsToDelete(updateCS, -diffRes.scaleNum, -diffRes.scaleNumOldRevision, notUpdatedPods, updatedPods)
+		podsPreparingToDelete := r.choosePodsToDelete(updateCS, diffRes.scaleDownNum, diffRes.scaleDownNumOldRevision, notUpdatedPods, updatedPods)
 		podsToDelete := make([]*v1.Pod, 0, len(podsPreparingToDelete))
 		for _, pod := range podsPreparingToDelete {
 			if !isPodReady(coreControl, pod) {
@@ -165,6 +155,14 @@ func (r *realControl) Scale(
 }
 
 func (r *realControl) managePreparingDelete(cs *appsv1alpha1.CloneSet, pods, podsInPreDelete []*v1.Pod, numToDelete int) (bool, error) {
+	//  We do not allow regret once the pod enter PreparingDelete state if MarkPodNotReady is set.
+	// Actually, there is a bug cased by this transformation from PreparingDelete to Normal,
+	// i.e., Lifecycle Updated Hook may be lost if the pod was transformed from Updating state
+	// to PreparingDelete.
+	if lifecycle.IsLifecycleMarkPodNotReady(cs.Spec.Lifecycle) {
+		return false, nil
+	}
+
 	diff := int(*cs.Spec.Replicas) - len(pods) + numToDelete
 	var modified bool
 	for _, pod := range podsInPreDelete {
@@ -175,13 +173,13 @@ func (r *realControl) managePreparingDelete(cs *appsv1alpha1.CloneSet, pods, pod
 			continue
 		}
 
-		klog.V(3).Infof("CloneSet %s patch pod %s lifecycle from PreparingDelete to Normal",
-			clonesetutils.GetControllerKey(cs), pod.Name)
-		if updated, err := r.lifecycleControl.UpdatePodLifecycle(pod, appspub.LifecycleStateNormal); err != nil {
+		klog.V(3).InfoS("CloneSet canceled deletion of pod and patch lifecycle from PreparingDelete to PreparingNormal",
+			"cloneSet", klog.KObj(cs), "pod", klog.KObj(pod))
+		if updated, gotPod, err := r.lifecycleControl.UpdatePodLifecycle(pod, appspub.LifecycleStatePreparingNormal, false); err != nil {
 			return modified, err
 		} else if updated {
 			modified = true
-			clonesetutils.ResourceVersionExpectations.Expect(pod)
+			clonesetutils.ResourceVersionExpectations.Expect(gotPod)
 		}
 		diff--
 	}
@@ -217,7 +215,7 @@ func (r *realControl) createPods(
 		if clonesetutils.EqualToRevisionHash("", pod, currentRevision) {
 			cs = currentCS
 		}
-		lifecycle.SetPodLifecycle(appspub.LifecycleStateNormal)(pod)
+		lifecycle.SetPodLifecycle(appspub.LifecycleStatePreparingNormal)(pod)
 
 		var createErr error
 		if createErr = r.createOnePod(cs, pod, existingPVCNames); createErr != nil {
@@ -270,13 +268,14 @@ func (r *realControl) deletePods(cs *appsv1alpha1.CloneSet, podsToDelete []*v1.P
 	var modified bool
 	for _, pod := range podsToDelete {
 		if cs.Spec.Lifecycle != nil && lifecycle.IsPodHooked(cs.Spec.Lifecycle.PreDelete, pod) {
-			if updated, err := r.lifecycleControl.UpdatePodLifecycle(pod, appspub.LifecycleStatePreparingDelete); err != nil {
+			markPodNotReady := cs.Spec.Lifecycle.PreDelete.MarkPodNotReady
+			if updated, gotPod, err := r.lifecycleControl.UpdatePodLifecycle(pod, appspub.LifecycleStatePreparingDelete, markPodNotReady); err != nil {
 				return false, err
 			} else if updated {
-				klog.V(3).Infof("CloneSet %s scaling update pod %s lifecycle to PreparingDelete",
-					clonesetutils.GetControllerKey(cs), pod.Name)
+				klog.V(3).InfoS("CloneSet scaling update pod lifecycle to PreparingDelete",
+					"cloneSet", klog.KObj(cs), "pod", klog.KObj(pod))
 				modified = true
-				clonesetutils.ResourceVersionExpectations.Expect(pod)
+				clonesetutils.ResourceVersionExpectations.Expect(gotPod)
 			}
 			continue
 		}
@@ -383,11 +382,11 @@ func (r *realControl) choosePodsToDelete(cs *appsv1alpha1.CloneSet, totalDiff in
 				Pods:   pods,
 				Ranker: ranker,
 				AvailableFunc: func(pod *v1.Pod) bool {
-					return isPodAvailable(coreControl, pod, cs.Spec.MinReadySeconds)
+					return IsPodAvailable(coreControl, pod, cs.Spec.MinReadySeconds)
 				},
 			})
 		} else if diff > len(pods) {
-			klog.Warningf("Diff > len(pods) in choosePodsToDelete func which is not expected.")
+			klog.InfoS("Diff > len(pods) in choosePodsToDelete func which is not expected")
 			return pods
 		}
 		return pods[:diff]

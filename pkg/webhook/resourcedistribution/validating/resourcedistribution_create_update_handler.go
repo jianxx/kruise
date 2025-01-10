@@ -19,6 +19,8 @@ import (
 	"net/http"
 
 	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
+	"github.com/openkruise/kruise/pkg/features"
+	utilfeature "github.com/openkruise/kruise/pkg/util/feature"
 	webhookutil "github.com/openkruise/kruise/pkg/webhook/util"
 
 	admissionv1 "k8s.io/api/admission/v1"
@@ -31,7 +33,6 @@ import (
 	"k8s.io/klog/v2"
 	coreval "k8s.io/kubernetes/pkg/apis/core/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/runtime/inject"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
@@ -57,7 +58,7 @@ func (h *ResourceDistributionCreateUpdateHandler) validateResourceDistributionSp
 		return
 	}
 	// deserialize old resource if need
-	var oldResource runtime.Object = nil
+	var oldResource runtime.Object
 	if oldObj != nil {
 		oldResource, errs = DeserializeResource(&oldObj.Spec.Resource, fldPath)
 		allErrs = append(allErrs, errs...)
@@ -117,7 +118,7 @@ func (h *ResourceDistributionCreateUpdateHandler) validateResourceDistributionSp
 		}
 	}
 	if len(conflicted) != 0 {
-		allErrs = append(allErrs, field.Invalid(fldPath, targets, fmt.Sprintf("ambiguous targets because namespace %v is in both IncludedNamespaces.List and ExcludedNamesapces.List", conflicted)))
+		allErrs = append(allErrs, field.Invalid(fldPath, targets, fmt.Sprintf("ambiguous targets because namespace %v is in both IncludedNamespaces.List and ExcludedNamespaces.List", conflicted)))
 	}
 
 	// 2. validate targets.NamespaceLabelSelector
@@ -151,25 +152,12 @@ func (h *ResourceDistributionCreateUpdateHandler) Handle(ctx context.Context, re
 			return admission.Errored(http.StatusBadRequest, err)
 		}
 	}
+	if !utilfeature.DefaultFeatureGate.Enabled(features.ResourceDistributionGate) {
+		return admission.Errored(http.StatusForbidden, fmt.Errorf("feature-gate %s is not enabled", features.ResourceDistributionGate))
+	}
 	if allErrs := h.validateResourceDistribution(obj, oldObj); len(allErrs) != 0 {
-		klog.V(3).Infof("all errors of validation: %v", allErrs)
+		klog.V(3).InfoS("all errors of validation", "errors", fmt.Sprintf("%v", allErrs))
 		return admission.Errored(http.StatusUnprocessableEntity, allErrs.ToAggregate())
 	}
 	return admission.ValidationResponse(true, "")
-}
-
-var _ inject.Client = &ResourceDistributionCreateUpdateHandler{}
-
-// InjectClient injects the client into the ResourceDistributionCreateUpdateHandler
-func (h *ResourceDistributionCreateUpdateHandler) InjectClient(c client.Client) error {
-	h.Client = c
-	return nil
-}
-
-var _ admission.DecoderInjector = &ResourceDistributionCreateUpdateHandler{}
-
-// InjectDecoder injects the decoder into the ResourceDistributionCreateUpdateHandler
-func (h *ResourceDistributionCreateUpdateHandler) InjectDecoder(d *admission.Decoder) error {
-	h.Decoder = d
-	return nil
 }

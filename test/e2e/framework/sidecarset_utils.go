@@ -25,6 +25,7 @@ import (
 	"github.com/openkruise/kruise/pkg/control/sidecarcontrol"
 	"github.com/openkruise/kruise/pkg/util"
 	webhookutil "github.com/openkruise/kruise/pkg/webhook/util"
+	"k8s.io/utils/ptr"
 
 	"github.com/onsi/gomega"
 	apps "k8s.io/api/apps/v1"
@@ -36,7 +37,6 @@ import (
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/util/retry"
 	imageutils "k8s.io/kubernetes/test/utils/image"
-	utilpointer "k8s.io/utils/pointer"
 )
 
 type SidecarSetTester struct {
@@ -59,6 +59,9 @@ func (s *SidecarSetTester) NewBaseSidecarSet(ns string) *appsv1alpha1.SidecarSet
 		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "test-sidecarset",
+			Labels: map[string]string{
+				"app": "sidecar",
+			},
 		},
 		Spec: appsv1alpha1.SidecarSetSpec{
 			InitContainers: []appsv1alpha1.SidecarContainer{
@@ -73,9 +76,10 @@ func (s *SidecarSetTester) NewBaseSidecarSet(ns string) *appsv1alpha1.SidecarSet
 			Containers: []appsv1alpha1.SidecarContainer{
 				{
 					Container: corev1.Container{
-						Name:    "nginx-sidecar",
-						Image:   imageutils.GetE2EImage(imageutils.Nginx),
-						Command: []string{"tail", "-f", "/dev/null"},
+						Name:            "nginx-sidecar",
+						Image:           imageutils.GetE2EImage(imageutils.Nginx),
+						ImagePullPolicy: corev1.PullIfNotPresent,
+						Command:         []string{"tail", "-f", "/dev/null"},
 					},
 					PodInjectPolicy: appsv1alpha1.BeforeAppContainerType,
 					ShareVolumePolicy: appsv1alpha1.ShareVolumePolicy{
@@ -110,7 +114,7 @@ func (s *SidecarSetTester) NewBaseDeployment(namespace string) *apps.Deployment 
 			Namespace: namespace,
 		},
 		Spec: apps.DeploymentSpec{
-			Replicas: utilpointer.Int32Ptr(1),
+			Replicas: ptr.To(int32(1)),
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
 					"app": "sidecarset",
@@ -126,7 +130,7 @@ func (s *SidecarSetTester) NewBaseDeployment(namespace string) *apps.Deployment 
 					Containers: []corev1.Container{
 						{
 							Name:    "main",
-							Image:   imageutils.GetE2EImage(imageutils.BusyBox),
+							Image:   "busybox:latest",
 							Command: []string{"/bin/sh", "-c", "sleep 10000000"},
 						},
 					},
@@ -136,13 +140,12 @@ func (s *SidecarSetTester) NewBaseDeployment(namespace string) *apps.Deployment 
 	}
 }
 
-func (s *SidecarSetTester) CreateSidecarSet(sidecarSet *appsv1alpha1.SidecarSet) *appsv1alpha1.SidecarSet {
+func (s *SidecarSetTester) CreateSidecarSet(sidecarSet *appsv1alpha1.SidecarSet) (*appsv1alpha1.SidecarSet, error) {
 	Logf("create sidecarSet(%s)", sidecarSet.Name)
 	_, err := s.kc.AppsV1alpha1().SidecarSets().Create(context.TODO(), sidecarSet, metav1.CreateOptions{})
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
 	s.WaitForSidecarSetCreated(sidecarSet)
-	sidecarSet, _ = s.kc.AppsV1alpha1().SidecarSets().Get(context.TODO(), sidecarSet.Name, metav1.GetOptions{})
-	return sidecarSet
+	return s.kc.AppsV1alpha1().SidecarSets().Get(context.TODO(), sidecarSet.Name, metav1.GetOptions{})
 }
 
 func (s *SidecarSetTester) UpdateSidecarSet(sidecarSet *appsv1alpha1.SidecarSet) {
@@ -162,8 +165,23 @@ func (s *SidecarSetTester) UpdateSidecarSet(sidecarSet *appsv1alpha1.SidecarSet)
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
 }
 
+func (s *SidecarSetTester) UpdateDeployment(obj *apps.Deployment) {
+	objClone, _ := s.c.AppsV1().Deployments(obj.Namespace).Get(context.TODO(), obj.Name, metav1.GetOptions{})
+	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		objClone.Spec = obj.Spec
+		_, updateErr := s.c.AppsV1().Deployments(obj.Namespace).Update(context.TODO(), objClone, metav1.UpdateOptions{})
+		if updateErr == nil {
+			return nil
+		}
+		objClone, _ = s.c.AppsV1().Deployments(obj.Namespace).Get(context.TODO(), obj.Name, metav1.GetOptions{})
+		return updateErr
+	})
+	gomega.Expect(err).NotTo(gomega.HaveOccurred())
+	s.WaitForDeploymentRunning(obj)
+}
+
 func (s *SidecarSetTester) UpdatePod(pod *corev1.Pod) {
-	Logf("update pod(%s.%s)", pod.Namespace, pod.Name)
+	Logf("update pod(%s/%s)", pod.Namespace, pod.Name)
 	podClone := pod.DeepCopy()
 	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		podClone.Annotations = pod.Annotations
@@ -189,7 +207,8 @@ func (s *SidecarSetTester) WaitForSidecarSetUpgradeComplete(sidecarSet *appsv1al
 			if inner.Status.MatchedPods == exceptStatus.MatchedPods &&
 				inner.Status.UpdatedPods == exceptStatus.UpdatedPods &&
 				inner.Status.UpdatedReadyPods == exceptStatus.UpdatedReadyPods &&
-				inner.Status.ReadyPods == exceptStatus.ReadyPods {
+				inner.Status.ReadyPods == exceptStatus.ReadyPods &&
+				inner.Generation == inner.Status.ObservedGeneration {
 				return true, nil
 			}
 			return false, nil
@@ -201,7 +220,7 @@ func (s *SidecarSetTester) WaitForSidecarSetUpgradeComplete(sidecarSet *appsv1al
 }
 
 func (s *SidecarSetTester) CreateDeployment(deployment *apps.Deployment) {
-	Logf("create deployment(%s.%s)", deployment.Namespace, deployment.Name)
+	Logf("create deployment(%s/%s)", deployment.Namespace, deployment.Name)
 	_, err := s.c.AppsV1().Deployments(deployment.Namespace).Create(context.TODO(), deployment, metav1.CreateOptions{})
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
 	s.WaitForDeploymentRunning(deployment)
@@ -242,7 +261,7 @@ func (s *SidecarSetTester) DeleteDeployments(namespace string) {
 func (s *SidecarSetTester) DeleteDeployment(deployment *apps.Deployment) {
 	err := s.c.AppsV1().Deployments(deployment.Namespace).Delete(context.TODO(), deployment.Name, metav1.DeleteOptions{})
 	if err != nil {
-		Logf("delete deployment(%s.%s) failed: %s", deployment.Namespace, deployment.Name, err.Error())
+		Logf("delete deployment(%s/%s) failed: %s", deployment.Namespace, deployment.Name, err.Error())
 		return
 	}
 	s.WaitForDeploymentDeleted(deployment)
@@ -269,7 +288,8 @@ func (s *SidecarSetTester) WaitForDeploymentRunning(deployment *apps.Deployment)
 			if err != nil {
 				return false, nil
 			}
-			if *inner.Spec.Replicas == inner.Status.ReadyReplicas {
+			if inner.Status.ObservedGeneration == inner.Generation && *inner.Spec.Replicas == inner.Status.UpdatedReplicas &&
+				*inner.Spec.Replicas == inner.Status.ReadyReplicas && *inner.Spec.Replicas == inner.Status.Replicas {
 				return true, nil
 			}
 			return false, nil
@@ -314,7 +334,7 @@ func (s *SidecarSetTester) WaitForSidecarSetDeleted(sidecarSet *appsv1alpha1.Sid
 }
 
 func (s *SidecarSetTester) GetSelectorPods(namespace string, selector *metav1.LabelSelector) ([]*corev1.Pod, error) {
-	faster, err := util.GetFastLabelSelector(selector)
+	faster, err := util.ValidatedLabelSelectorAsSelector(selector)
 	if err != nil {
 		return nil, err
 	}
@@ -343,7 +363,7 @@ func (s *SidecarSetTester) NewBaseCloneSet(namespace string) *appsv1alpha1.Clone
 			Namespace: namespace,
 		},
 		Spec: appsv1alpha1.CloneSetSpec{
-			Replicas: utilpointer.Int32Ptr(2),
+			Replicas: ptr.To(int32(2)),
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
 					"app": "sidecarset",
@@ -380,20 +400,20 @@ func (s *SidecarSetTester) NewBaseCloneSet(namespace string) *appsv1alpha1.Clone
 	}
 }
 
-func (t *SidecarSetTester) CreateCloneSet(cloneset *appsv1alpha1.CloneSet) *appsv1alpha1.CloneSet {
-	Logf("create CloneSet(%s.%s)", cloneset.Namespace, cloneset.Name)
-	_, err := t.kc.AppsV1alpha1().CloneSets(cloneset.Namespace).Create(context.TODO(), cloneset, metav1.CreateOptions{})
+func (s *SidecarSetTester) CreateCloneSet(cloneset *appsv1alpha1.CloneSet) *appsv1alpha1.CloneSet {
+	Logf("create CloneSet(%s/%s)", cloneset.Namespace, cloneset.Name)
+	_, err := s.kc.AppsV1alpha1().CloneSets(cloneset.Namespace).Create(context.TODO(), cloneset, metav1.CreateOptions{})
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
-	t.WaitForCloneSetRunning(cloneset)
-	Logf("create cloneset(%s.%s) done", cloneset.Namespace, cloneset.Name)
-	cloneset, _ = t.kc.AppsV1alpha1().CloneSets(cloneset.Namespace).Get(context.TODO(), cloneset.Name, metav1.GetOptions{})
+	s.WaitForCloneSetRunning(cloneset)
+	Logf("create cloneset(%s/%s) done", cloneset.Namespace, cloneset.Name)
+	cloneset, _ = s.kc.AppsV1alpha1().CloneSets(cloneset.Namespace).Get(context.TODO(), cloneset.Name, metav1.GetOptions{})
 	return cloneset
 }
 
-func (t *SidecarSetTester) WaitForCloneSetRunning(cloneset *appsv1alpha1.CloneSet) {
+func (s *SidecarSetTester) WaitForCloneSetRunning(cloneset *appsv1alpha1.CloneSet) {
 	pollErr := wait.PollImmediate(time.Second, time.Minute*5,
 		func() (bool, error) {
-			inner, err := t.kc.AppsV1alpha1().CloneSets(cloneset.Namespace).Get(context.TODO(), cloneset.Name, metav1.GetOptions{})
+			inner, err := s.kc.AppsV1alpha1().CloneSets(cloneset.Namespace).Get(context.TODO(), cloneset.Name, metav1.GetOptions{})
 			if err != nil {
 				return false, err
 			}
@@ -407,12 +427,12 @@ func (t *SidecarSetTester) WaitForCloneSetRunning(cloneset *appsv1alpha1.CloneSe
 	}
 }
 
-func (t *SidecarSetTester) ListControllerRevisions(sidecarSet *appsv1alpha1.SidecarSet) []*apps.ControllerRevision {
-	selector, err := util.GetFastLabelSelector(&metav1.LabelSelector{MatchLabels: map[string]string{
+func (s *SidecarSetTester) ListControllerRevisions(sidecarSet *appsv1alpha1.SidecarSet) []*apps.ControllerRevision {
+	selector, err := util.ValidatedLabelSelectorAsSelector(&metav1.LabelSelector{MatchLabels: map[string]string{
 		sidecarcontrol.SidecarSetKindName: sidecarSet.Name,
 	}})
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
-	revisionList, err := t.c.AppsV1().ControllerRevisions(webhookutil.GetNamespace()).List(context.TODO(), metav1.ListOptions{LabelSelector: selector.String()})
+	revisionList, err := s.c.AppsV1().ControllerRevisions(webhookutil.GetNamespace()).List(context.TODO(), metav1.ListOptions{LabelSelector: selector.String()})
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
 	revisions := make([]*apps.ControllerRevision, len(revisionList.Items))
 	for i := range revisionList.Items {

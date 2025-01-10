@@ -17,20 +17,23 @@ limitations under the License.
 package uniteddeployment
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"testing"
 
 	"github.com/onsi/gomega"
-	"golang.org/x/net/context"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
+	appsv1beta1 "github.com/openkruise/kruise/apis/apps/v1beta1"
 )
 
 func TestAstsReconcile(t *testing.T) {
@@ -61,7 +64,7 @@ func TestAstsReconcile(t *testing.T) {
 							"name": caseName,
 						},
 					},
-					Spec: appsv1alpha1.StatefulSetSpec{
+					Spec: appsv1beta1.StatefulSetSpec{
 						Selector: &metav1.LabelSelector{
 							MatchLabels: map[string]string{
 								"name": caseName,
@@ -119,7 +122,7 @@ func TestAstsReconcile(t *testing.T) {
 	expectedAstsCount(g, instance, 1)
 }
 
-func TestTemplateTypeSwtich(t *testing.T) {
+func TestTemplateTypeSwitch(t *testing.T) {
 	g, requests, cancel, mgrStopped := setUp(t)
 	defer func() {
 		clean(g, c)
@@ -218,7 +221,7 @@ func TestTemplateTypeSwtich(t *testing.T) {
 				"name": caseName,
 			},
 		},
-		Spec: appsv1alpha1.StatefulSetSpec{
+		Spec: appsv1beta1.StatefulSetSpec{
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
 					"name": caseName,
@@ -277,7 +280,7 @@ func TestAstsSubsetProvision(t *testing.T) {
 							"name": caseName,
 						},
 					},
-					Spec: appsv1alpha1.StatefulSetSpec{
+					Spec: appsv1beta1.StatefulSetSpec{
 						Selector: &metav1.LabelSelector{
 							MatchLabels: map[string]string{
 								"name": caseName,
@@ -452,6 +455,215 @@ func TestAstsSubsetProvision(t *testing.T) {
 	g.Expect(sts.Spec.Template.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[1].MatchExpressions[1].Values[0]).Should(gomega.BeEquivalentTo("node-b"))
 }
 
+func TestAstsSubsetPatch(t *testing.T) {
+	g, requests, cancel, mgrStopped := setUp(t)
+	defer func() {
+		clean(g, c)
+		cancel()
+		mgrStopped.Wait()
+	}()
+
+	caseName := "test-asts-subset-patch"
+
+	imagePatch := map[string]interface{}{
+		"spec": map[string]interface{}{
+			"containers": []map[string]interface{}{
+				{
+					"name":  "container-a",
+					"image": "nginx:2.0",
+				},
+			},
+		},
+	}
+	labelPatch := map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"labels": map[string]string{
+				"zone": "a",
+			},
+		},
+	}
+	resourcePatch := map[string]interface{}{
+		"spec": map[string]interface{}{
+			"containers": []map[string]interface{}{
+				{
+					"name": "container-a",
+					"resources": map[string]interface{}{
+						"limits": map[string]interface{}{
+							"cpu":    "2",
+							"memory": "800Mi",
+						},
+					},
+				},
+			},
+		},
+	}
+	envPatch := map[string]interface{}{
+		"spec": map[string]interface{}{
+			"containers": []map[string]interface{}{
+				{
+					"name": "container-a",
+					"env": []map[string]string{
+						{
+							"name":  "K8S_CONTAINER_NAME",
+							"value": "main",
+						},
+					},
+				},
+			},
+		},
+	}
+	labelPatchBytes, _ := json.Marshal(labelPatch)
+	imagePatchBytes, _ := json.Marshal(imagePatch)
+	resourcePatchBytes, _ := json.Marshal(resourcePatch)
+	envPatchBytes, _ := json.Marshal(envPatch)
+	instance := &appsv1alpha1.UnitedDeployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      caseName,
+			Namespace: "default",
+		},
+		Spec: appsv1alpha1.UnitedDeploymentSpec{
+			Replicas: &one,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"name": caseName,
+				},
+			},
+			Template: appsv1alpha1.SubsetTemplate{
+				AdvancedStatefulSetTemplate: &appsv1alpha1.AdvancedStatefulSetTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{
+							"name": caseName,
+						},
+					},
+					Spec: appsv1beta1.StatefulSetSpec{
+						Selector: &metav1.LabelSelector{
+							MatchLabels: map[string]string{
+								"name": caseName,
+							},
+						},
+						Template: corev1.PodTemplateSpec{
+							ObjectMeta: metav1.ObjectMeta{
+								Labels: map[string]string{
+									"name": caseName,
+								},
+							},
+							Spec: corev1.PodSpec{
+								Containers: []corev1.Container{
+									{
+										Name:  "container-a",
+										Image: "nginx:1.0",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			Topology: appsv1alpha1.Topology{
+				Subsets: []appsv1alpha1.Subset{
+					{
+						Name: "subset-a",
+						Patch: runtime.RawExtension{
+							Raw: imagePatchBytes,
+						},
+						NodeSelectorTerm: corev1.NodeSelectorTerm{
+							MatchExpressions: []corev1.NodeSelectorRequirement{
+								{
+									Key:      "node-name",
+									Operator: corev1.NodeSelectorOpIn,
+									Values:   []string{"node-a"},
+								},
+							},
+						},
+					},
+					{
+						Name: "subset-b",
+						Patch: runtime.RawExtension{
+							Raw: labelPatchBytes,
+						},
+						NodeSelectorTerm: corev1.NodeSelectorTerm{
+							MatchExpressions: []corev1.NodeSelectorRequirement{
+								{
+									Key:      "node-name",
+									Operator: corev1.NodeSelectorOpIn,
+									Values:   []string{"node-b"},
+								},
+							},
+						},
+					},
+					{
+						Name: "subset-c",
+						Patch: runtime.RawExtension{
+							Raw: resourcePatchBytes,
+						},
+						NodeSelectorTerm: corev1.NodeSelectorTerm{
+							MatchExpressions: []corev1.NodeSelectorRequirement{
+								{
+									Key:      "node-name",
+									Operator: corev1.NodeSelectorOpIn,
+									Values:   []string{"node-c"},
+								},
+							},
+						},
+					},
+					{
+						Name: "subset-d",
+						Patch: runtime.RawExtension{
+							Raw: envPatchBytes,
+						},
+						NodeSelectorTerm: corev1.NodeSelectorTerm{
+							MatchExpressions: []corev1.NodeSelectorRequirement{
+								{
+									Key:      "node-name",
+									Operator: corev1.NodeSelectorOpIn,
+									Values:   []string{"node-d"},
+								},
+							},
+						},
+					},
+				},
+			},
+			RevisionHistoryLimit: &ten,
+		},
+	}
+
+	// Create the UnitedDeployment object and expect the Reconcile and Deployment to be created
+	err := c.Create(context.TODO(), instance)
+	// The instance object may not be a valid object because it might be missing some required fields.
+	// Please modify the instance object by adding required fields and then remove the following if statement.
+	if apierrors.IsInvalid(err) {
+		t.Logf("failed to create object, got an invalid object error: %v", err)
+		return
+	}
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	defer c.Delete(context.TODO(), instance)
+	waitReconcilerProcessFinished(g, requests, 3)
+
+	astsList := expectedAstsCount(g, instance, 4)
+	asts := getSubsetAstsByName(astsList, "subset-a")
+	g.Expect(asts.Spec).ShouldNot(gomega.BeNil())
+	g.Expect(asts.Spec.Template.Spec.Containers[0].Image).Should(gomega.BeEquivalentTo("nginx:2.0"))
+
+	asts = getSubsetAstsByName(astsList, "subset-b")
+	g.Expect(asts.Spec).ShouldNot(gomega.BeNil())
+	g.Expect(asts.Spec.Template.Labels).Should(gomega.HaveKeyWithValue("zone", "a"))
+
+	asts = getSubsetAstsByName(astsList, "subset-c")
+	g.Expect(asts.Spec).ShouldNot(gomega.BeNil())
+	g.Expect(asts.Spec.Template.Spec.Containers[0].Resources).ShouldNot(gomega.BeNil())
+	g.Expect(asts.Spec.Template.Spec.Containers[0].Resources.Limits).ShouldNot(gomega.BeNil())
+	g.Expect(asts.Spec.Template.Spec.Containers[0].Resources.Limits.Cpu()).ShouldNot(gomega.BeNil())
+	g.Expect(asts.Spec.Template.Spec.Containers[0].Resources.Limits.Cpu().Value()).Should(gomega.BeEquivalentTo(2))
+	g.Expect(asts.Spec.Template.Spec.Containers[0].Resources.Limits.Memory()).ShouldNot(gomega.BeNil())
+	g.Expect(asts.Spec.Template.Spec.Containers[0].Resources.Limits.Memory().String()).Should(gomega.BeEquivalentTo("800Mi"))
+
+	asts = getSubsetAstsByName(astsList, "subset-d")
+	g.Expect(asts.Spec).ShouldNot(gomega.BeNil())
+	g.Expect(asts.Spec.Template.Spec.Containers[0].Env).ShouldNot(gomega.BeNil())
+	g.Expect(asts.Spec.Template.Spec.Containers[0].Env[0].Name).Should(gomega.BeEquivalentTo("K8S_CONTAINER_NAME"))
+	g.Expect(asts.Spec.Template.Spec.Containers[0].Env[0].Value).Should(gomega.BeEquivalentTo("main"))
+}
+
 func TestAstsSubsetProvisionWithToleration(t *testing.T) {
 	g, requests, cancel, mgrStopped := setUp(t)
 	defer func() {
@@ -480,7 +692,7 @@ func TestAstsSubsetProvisionWithToleration(t *testing.T) {
 							"name": caseName,
 						},
 					},
-					Spec: appsv1alpha1.StatefulSetSpec{
+					Spec: appsv1beta1.StatefulSetSpec{
 						Selector: &metav1.LabelSelector{
 							MatchLabels: map[string]string{
 								"name": caseName,
@@ -591,7 +803,7 @@ func TestAstsDupSubset(t *testing.T) {
 							"name": caseName,
 						},
 					},
-					Spec: appsv1alpha1.StatefulSetSpec{
+					Spec: appsv1beta1.StatefulSetSpec{
 						Selector: &metav1.LabelSelector{
 							MatchLabels: map[string]string{
 								"name": caseName,
@@ -686,7 +898,7 @@ func TestAstsScale(t *testing.T) {
 							"name": caseName,
 						},
 					},
-					Spec: appsv1alpha1.StatefulSetSpec{
+					Spec: appsv1beta1.StatefulSetSpec{
 						Selector: &metav1.LabelSelector{
 							MatchLabels: map[string]string{
 								"name": caseName,
@@ -834,7 +1046,7 @@ func TestAstsUpdate(t *testing.T) {
 							"name": caseName,
 						},
 					},
-					Spec: appsv1alpha1.StatefulSetSpec{
+					Spec: appsv1beta1.StatefulSetSpec{
 						Selector: &metav1.LabelSelector{
 							MatchLabels: map[string]string{
 								"name": caseName,
@@ -958,7 +1170,7 @@ func TestAstsRollingUpdatePartition(t *testing.T) {
 							"name": caseName,
 						},
 					},
-					Spec: appsv1alpha1.StatefulSetSpec{
+					Spec: appsv1beta1.StatefulSetSpec{
 						Selector: &metav1.LabelSelector{
 							MatchLabels: map[string]string{
 								"name": caseName,
@@ -1145,7 +1357,7 @@ func TestAstsOnDelete(t *testing.T) {
 							"name": caseName,
 						},
 					},
-					Spec: appsv1alpha1.StatefulSetSpec{
+					Spec: appsv1beta1.StatefulSetSpec{
 						Selector: &metav1.LabelSelector{
 							MatchLabels: map[string]string{
 								"name": caseName,
@@ -1166,7 +1378,7 @@ func TestAstsOnDelete(t *testing.T) {
 								},
 							},
 						},
-						UpdateStrategy: appsv1alpha1.StatefulSetUpdateStrategy{
+						UpdateStrategy: appsv1beta1.StatefulSetUpdateStrategy{
 							Type: appsv1.OnDeleteStatefulSetStrategyType,
 						},
 					},
@@ -1301,7 +1513,7 @@ func TestAstsSubsetCount(t *testing.T) {
 							"name": caseName,
 						},
 					},
-					Spec: appsv1alpha1.StatefulSetSpec{
+					Spec: appsv1beta1.StatefulSetSpec{
 						Selector: &metav1.LabelSelector{
 							MatchLabels: map[string]string{
 								"name": caseName,
@@ -1501,8 +1713,8 @@ func TestAstsSubsetCount(t *testing.T) {
 	g.Expect(setsubB.Spec.Template.Spec.Containers[0].Image).Should(gomega.BeEquivalentTo("nginx:5.0"))
 }
 
-func expectedAstsCount(g *gomega.GomegaWithT, ud *appsv1alpha1.UnitedDeployment, count int) *appsv1alpha1.StatefulSetList {
-	stsList := &appsv1alpha1.StatefulSetList{}
+func expectedAstsCount(g *gomega.GomegaWithT, ud *appsv1alpha1.UnitedDeployment, count int) *appsv1beta1.StatefulSetList {
+	stsList := &appsv1beta1.StatefulSetList{}
 
 	selector, err := metav1.LabelSelectorAsSelector(ud.Spec.Selector)
 	g.Expect(err).Should(gomega.BeNil())
@@ -1522,7 +1734,7 @@ func expectedAstsCount(g *gomega.GomegaWithT, ud *appsv1alpha1.UnitedDeployment,
 	return stsList
 }
 
-func getSubsetAstsByName(stsList *appsv1alpha1.StatefulSetList, name string) *appsv1alpha1.StatefulSet {
+func getSubsetAstsByName(stsList *appsv1beta1.StatefulSetList, name string) *appsv1beta1.StatefulSet {
 	for _, sts := range stsList.Items {
 		if sts.Labels[appsv1alpha1.SubSetNameLabelKey] == name {
 			return &sts

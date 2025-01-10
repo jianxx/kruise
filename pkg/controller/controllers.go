@@ -24,12 +24,17 @@ import (
 	"github.com/openkruise/kruise/pkg/controller/containerrecreaterequest"
 	"github.com/openkruise/kruise/pkg/controller/daemonset"
 	"github.com/openkruise/kruise/pkg/controller/ephemeraljob"
+	"github.com/openkruise/kruise/pkg/controller/imagelistpulljob"
 	"github.com/openkruise/kruise/pkg/controller/imagepulljob"
 	"github.com/openkruise/kruise/pkg/controller/nodeimage"
+	"github.com/openkruise/kruise/pkg/controller/nodepodprobe"
+	"github.com/openkruise/kruise/pkg/controller/persistentpodstate"
+	"github.com/openkruise/kruise/pkg/controller/podprobemarker"
 	"github.com/openkruise/kruise/pkg/controller/podreadiness"
 	"github.com/openkruise/kruise/pkg/controller/podunavailablebudget"
 	"github.com/openkruise/kruise/pkg/controller/resourcedistribution"
 	"github.com/openkruise/kruise/pkg/controller/sidecarset"
+	"github.com/openkruise/kruise/pkg/controller/sidecarterminator"
 	"github.com/openkruise/kruise/pkg/controller/statefulset"
 	"github.com/openkruise/kruise/pkg/controller/uniteddeployment"
 	"github.com/openkruise/kruise/pkg/controller/workloadspread"
@@ -57,13 +62,18 @@ func init() {
 	controllerAddFuncs = append(controllerAddFuncs, resourcedistribution.Add)
 	controllerAddFuncs = append(controllerAddFuncs, ephemeraljob.Add)
 	controllerAddFuncs = append(controllerAddFuncs, containerlauchpriority.Add)
+	controllerAddFuncs = append(controllerAddFuncs, persistentpodstate.Add)
+	controllerAddFuncs = append(controllerAddFuncs, sidecarterminator.Add)
+	controllerAddFuncs = append(controllerAddFuncs, podprobemarker.Add)
+	controllerAddFuncs = append(controllerAddFuncs, nodepodprobe.Add)
+	controllerAddFuncs = append(controllerAddFuncs, imagelistpulljob.Add)
 }
 
 func SetupWithManager(m manager.Manager) error {
 	for _, f := range controllerAddFuncs {
 		if err := f(m); err != nil {
 			if kindMatchErr, ok := err.(*meta.NoKindMatchError); ok {
-				klog.Infof("CRD %v is not installed, its controller will perform noops!", kindMatchErr.GroupKind)
+				klog.InfoS("CRD is not installed, its controller will perform noops!", "CRD", kindMatchErr.GroupKind)
 				continue
 			}
 			return err

@@ -17,14 +17,17 @@ limitations under the License.
 package defaults
 
 import (
-	"github.com/openkruise/kruise/apis/apps/v1beta1"
 	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	v1 "k8s.io/kubernetes/pkg/apis/core/v1"
 	utilpointer "k8s.io/utils/pointer"
+
+	"github.com/openkruise/kruise/apis/apps/v1beta1"
+	"github.com/openkruise/kruise/pkg/features"
+	utilfeature "github.com/openkruise/kruise/pkg/util/feature"
 )
 
-// SetDefaults_StatefulSet set default values for StatefulSet.
+// SetDefaultsStatefulSet set default values for StatefulSet.
 func SetDefaultsStatefulSet(obj *v1beta1.StatefulSet, injectTemplateDefaults bool) {
 	if len(obj.Spec.PodManagementPolicy) == 0 {
 		obj.Spec.PodManagementPolicy = appsv1.OrderedReadyPodManagement
@@ -32,13 +35,11 @@ func SetDefaultsStatefulSet(obj *v1beta1.StatefulSet, injectTemplateDefaults boo
 
 	if obj.Spec.UpdateStrategy.Type == "" {
 		obj.Spec.UpdateStrategy.Type = appsv1.RollingUpdateStatefulSetStrategyType
-
-		// UpdateStrategy.RollingUpdate will take default values below.
-		obj.Spec.UpdateStrategy.RollingUpdate = &v1beta1.RollingUpdateStatefulSetStrategy{}
 	}
 
 	if obj.Spec.UpdateStrategy.Type == appsv1.RollingUpdateStatefulSetStrategyType {
 		if obj.Spec.UpdateStrategy.RollingUpdate == nil {
+			// UpdateStrategy.RollingUpdate will take default values below.
 			obj.Spec.UpdateStrategy.RollingUpdate = &v1beta1.RollingUpdateStatefulSetStrategy{}
 		}
 		if obj.Spec.UpdateStrategy.RollingUpdate.Partition == nil {
@@ -53,6 +54,24 @@ func SetDefaultsStatefulSet(obj *v1beta1.StatefulSet, injectTemplateDefaults boo
 		}
 		if obj.Spec.UpdateStrategy.RollingUpdate.MinReadySeconds == nil {
 			obj.Spec.UpdateStrategy.RollingUpdate.MinReadySeconds = utilpointer.Int32Ptr(0)
+		}
+	}
+
+	if utilfeature.DefaultFeatureGate.Enabled(features.StatefulSetAutoDeletePVC) {
+		if obj.Spec.PersistentVolumeClaimRetentionPolicy == nil {
+			obj.Spec.PersistentVolumeClaimRetentionPolicy = &v1beta1.StatefulSetPersistentVolumeClaimRetentionPolicy{}
+		}
+		if len(obj.Spec.PersistentVolumeClaimRetentionPolicy.WhenDeleted) == 0 {
+			obj.Spec.PersistentVolumeClaimRetentionPolicy.WhenDeleted = v1beta1.RetainPersistentVolumeClaimRetentionPolicyType
+		}
+		if len(obj.Spec.PersistentVolumeClaimRetentionPolicy.WhenScaled) == 0 {
+			obj.Spec.PersistentVolumeClaimRetentionPolicy.WhenScaled = v1beta1.RetainPersistentVolumeClaimRetentionPolicyType
+		}
+	}
+
+	if utilfeature.DefaultFeatureGate.Enabled(features.StatefulSetAutoResizePVCGate) {
+		if obj.Spec.VolumeClaimUpdateStrategy.Type == "" {
+			obj.Spec.VolumeClaimUpdateStrategy.Type = v1beta1.OnPVCDeleteVolumeClaimUpdateStrategyType
 		}
 	}
 

@@ -20,14 +20,16 @@ import (
 	"context"
 	"sort"
 
-	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
-	kruiseclientset "github.com/openkruise/kruise/pkg/client/clientset/versioned"
-	"github.com/openkruise/kruise/pkg/util"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/util/retry"
 	imageutils "k8s.io/kubernetes/test/utils/image"
+
+	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
+	kruiseclientset "github.com/openkruise/kruise/pkg/client/clientset/versioned"
+	"github.com/openkruise/kruise/pkg/util"
 )
 
 type CloneSetTester struct {
@@ -66,6 +68,16 @@ func (t *CloneSetTester) NewCloneSet(name string, replicas int32, updateStrategy
 							Env: []v1.EnvVar{
 								{Name: "test", Value: "foo"},
 							},
+							Resources: v1.ResourceRequirements{
+								Requests: map[v1.ResourceName]resource.Quantity{
+									v1.ResourceCPU:    resource.MustParse("200m"),
+									v1.ResourceMemory: resource.MustParse("200Mi"),
+								},
+								Limits: map[v1.ResourceName]resource.Quantity{
+									v1.ResourceCPU:    resource.MustParse("1"),
+									v1.ResourceMemory: resource.MustParse("1Gi"),
+								},
+							},
 						},
 					},
 				},
@@ -102,12 +114,33 @@ func (t *CloneSetTester) ListPodsForCloneSet(name string) (pods []*v1.Pod, err e
 	}
 	for i := range podList.Items {
 		pod := &podList.Items[i]
+		// ignore deleting pod
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
 		if owner := metav1.GetControllerOf(pod); owner != nil && owner.Name == name {
 			pods = append(pods, pod)
 		}
 	}
 	sort.SliceStable(pods, func(i, j int) bool {
 		return pods[i].Name < pods[j].Name
+	})
+	return
+}
+
+func (t *CloneSetTester) ListPVCForCloneSet() (pvcs []*v1.PersistentVolumeClaim, err error) {
+	pvcList, err := t.c.CoreV1().PersistentVolumeClaims(t.ns).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	for i := range pvcList.Items {
+		pvc := &pvcList.Items[i]
+		if pvc.DeletionTimestamp.IsZero() {
+			pvcs = append(pvcs, pvc)
+		}
+	}
+	sort.SliceStable(pvcs, func(i, j int) bool {
+		return pvcs[i].Name < pvcs[j].Name
 	})
 	return
 }
@@ -130,14 +163,18 @@ func (t *CloneSetTester) DeleteCloneSet(name string) error {
 	return t.kc.AppsV1alpha1().CloneSets(t.ns).Delete(context.TODO(), name, metav1.DeleteOptions{})
 }
 
-func (s *CloneSetTester) GetSelectorPods(namespace string, selector *metav1.LabelSelector) ([]v1.Pod, error) {
-	faster, err := util.GetFastLabelSelector(selector)
+func (t *CloneSetTester) GetSelectorPods(namespace string, selector *metav1.LabelSelector) ([]v1.Pod, error) {
+	faster, err := util.ValidatedLabelSelectorAsSelector(selector)
 	if err != nil {
 		return nil, err
 	}
-	podList, err := s.c.CoreV1().Pods(namespace).List(context.TODO(), metav1.ListOptions{LabelSelector: faster.String()})
+	podList, err := t.c.CoreV1().Pods(namespace).List(context.TODO(), metav1.ListOptions{LabelSelector: faster.String()})
 	if err != nil {
 		return nil, err
 	}
 	return podList.Items, nil
+}
+
+func (t *CloneSetTester) DeletePod(name string) error {
+	return t.c.CoreV1().Pods(t.ns).Delete(context.TODO(), name, metav1.DeleteOptions{})
 }

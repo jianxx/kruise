@@ -19,24 +19,65 @@ package controllerfinder
 import (
 	"context"
 
+	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
+	appsv1beta1 "github.com/openkruise/kruise/apis/apps/v1beta1"
+	"github.com/openkruise/kruise/pkg/util/configuration"
 	apps "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/dynamic"
+	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	scaleclient "k8s.io/client-go/scale"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-
-	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
-	appsv1beta1 "github.com/openkruise/kruise/apis/apps/v1beta1"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 )
+
+var Finder *ControllerFinder
+
+const ReplicasUnknown int32 = -1
+
+func InitControllerFinder(mgr manager.Manager) error {
+	Finder = &ControllerFinder{
+		Client: mgr.GetClient(),
+		mapper: mgr.GetRESTMapper(),
+	}
+	cfg := mgr.GetConfig()
+	if cfg.GroupVersion == nil {
+		cfg.GroupVersion = &schema.GroupVersion{}
+	}
+	codecs := serializer.NewCodecFactory(mgr.GetScheme())
+	cfg.NegotiatedSerializer = codecs.WithoutConversion()
+	restClient, err := rest.RESTClientFor(cfg)
+	if err != nil {
+		return err
+	}
+	k8sClient, err := clientset.NewForConfig(mgr.GetConfig())
+	if err != nil {
+		return err
+	}
+	Finder.discoveryClient = k8sClient.Discovery()
+	scaleKindResolver := scaleclient.NewDiscoveryScaleKindResolver(Finder.discoveryClient)
+	Finder.scaleNamespacer = scaleclient.New(restClient, Finder.mapper, dynamic.LegacyAPIPathResolverFunc, scaleKindResolver)
+	return nil
+}
 
 // ScaleAndSelector is used to return (controller, scale, selector) fields from the
 // controller finder functions.
 type ScaleAndSelector struct {
 	ControllerReference
-	// controller.spec.Replicas
+	// controller.spec.Replicas; the value -1 means it is uncertain currently
 	Scale int32
+	// kruise statefulSet.spec.ReserveOrdinals
+	ReserveOrdinals []int
 	// controller.spec.Selector
 	Selector *metav1.LabelSelector
 	// metadata
@@ -60,38 +101,34 @@ type PodControllerFinder func(ref ControllerReference, namespace string) (*Scale
 
 type ControllerFinder struct {
 	client.Client
-}
 
-func NewControllerFinder(c client.Client) *ControllerFinder {
-	return &ControllerFinder{
-		Client: c,
-	}
+	mapper          meta.RESTMapper
+	scaleNamespacer scaleclient.ScalesGetter
+	discoveryClient discovery.DiscoveryInterface
 }
 
 func (r *ControllerFinder) GetExpectedScaleForPods(pods []*corev1.Pod) (int32, error) {
 	// 1. Find the controller for each pod.  If any pod has 0 controllers,
 	// that's an error. With ControllerRef, a pod can only have 1 controller.
 	// A mapping from controllers to their scale.
+	podRefs := sets.NewString()
 	controllerScale := map[types.UID]int32{}
 	for _, pod := range pods {
 		ref := metav1.GetControllerOf(pod)
-		if ref == nil {
+		// ref has already been got, so there is no need to get again
+		if ref == nil || podRefs.Has(string(ref.UID)) {
 			continue
 		}
-		// If we already know the scale of the controller there is no need to do anything.
-		if _, found := controllerScale[ref.UID]; found {
-			continue
-		}
+		podRefs.Insert(string(ref.UID))
 		// Check all the supported controllers to find the desired scale.
 		workload, err := r.GetScaleAndSelectorForRef(ref.APIVersion, ref.Kind, pod.Namespace, ref.Name, ref.UID)
-		if err != nil && !errors.IsNotFound(err) {
+		if err != nil {
 			return 0, err
+		} else if workload == nil || !workload.Metadata.DeletionTimestamp.IsZero() {
+			continue
 		}
-		if workload != nil && workload.Metadata.DeletionTimestamp.IsZero() {
-			controllerScale[workload.UID] = workload.Scale
-		}
+		controllerScale[workload.UID] = workload.Scale
 	}
-
 	// 2. Add up all the controllers.
 	var expectedCount int32
 	for _, count := range controllerScale {
@@ -120,7 +157,7 @@ func (r *ControllerFinder) GetScaleAndSelectorForRef(apiVersion, kind, ns, name 
 
 func (r *ControllerFinder) Finders() []PodControllerFinder {
 	return []PodControllerFinder{r.getPodReplicationController, r.getPodDeployment, r.getPodReplicaSet,
-		r.getPodStatefulSet, r.getPodKruiseCloneSet, r.getPodKruiseStatefulSet}
+		r.getPodStatefulSet, r.getPodKruiseCloneSet, r.getPodKruiseStatefulSet, r.getPodStatefulSetLike, r.getScaleController, r.getRefUID}
 }
 
 var (
@@ -130,12 +167,14 @@ var (
 	ControllerKindDep      = apps.SchemeGroupVersion.WithKind("Deployment")
 	ControllerKruiseKindCS = appsv1alpha1.SchemeGroupVersion.WithKind("CloneSet")
 	ControllerKruiseKindSS = appsv1beta1.SchemeGroupVersion.WithKind("StatefulSet")
+
+	validWorkloadList = []schema.GroupVersionKind{ControllerKindRS, ControllerKindSS, ControllerKindRC, ControllerKindDep, ControllerKruiseKindCS, ControllerKruiseKindSS}
 )
 
 // getPodReplicaSet finds a replicaset which has no matching deployments.
 func (r *ControllerFinder) getPodReplicaSet(ref ControllerReference, namespace string) (*ScaleAndSelector, error) {
 	// This error is irreversible, so there is no need to return error
-	ok, _ := verifyGroupKind(ref, ControllerKindRS.Kind, []string{ControllerKindRS.Group})
+	ok, _ := verifyGroupKind(ref.APIVersion, ref.Kind, ControllerKindRS)
 	if !ok {
 		return nil, nil
 	}
@@ -156,6 +195,7 @@ func (r *ControllerFinder) getPodReplicaSet(ref ControllerReference, namespace s
 		}
 		return r.getPodDeployment(refSs, namespace)
 	}
+
 	return &ScaleAndSelector{
 		Scale:    *(replicaSet.Spec.Replicas),
 		Selector: replicaSet.Spec.Selector,
@@ -172,7 +212,7 @@ func (r *ControllerFinder) getPodReplicaSet(ref ControllerReference, namespace s
 // getPodReplicaSet finds a replicaset which has no matching deployments.
 func (r *ControllerFinder) getReplicaSet(ref ControllerReference, namespace string) (*apps.ReplicaSet, error) {
 	// This error is irreversible, so there is no need to return error
-	ok, _ := verifyGroupKind(ref, ControllerKindRS.Kind, []string{ControllerKindRS.Group})
+	ok, _ := verifyGroupKind(ref.APIVersion, ref.Kind, ControllerKindRS)
 	if !ok {
 		return nil, nil
 	}
@@ -194,7 +234,7 @@ func (r *ControllerFinder) getReplicaSet(ref ControllerReference, namespace stri
 // getPodStatefulSet returns the statefulset referenced by the provided controllerRef.
 func (r *ControllerFinder) getPodStatefulSet(ref ControllerReference, namespace string) (*ScaleAndSelector, error) {
 	// This error is irreversible, so there is no need to return error
-	ok, _ := verifyGroupKind(ref, ControllerKindSS.Kind, []string{ControllerKindSS.Group})
+	ok, _ := verifyGroupKind(ref.APIVersion, ref.Kind, ControllerKindSS)
 	if !ok {
 		return nil, nil
 	}
@@ -227,7 +267,7 @@ func (r *ControllerFinder) getPodStatefulSet(ref ControllerReference, namespace 
 // getPodDeployments finds deployments for any replicasets which are being managed by deployments.
 func (r *ControllerFinder) getPodDeployment(ref ControllerReference, namespace string) (*ScaleAndSelector, error) {
 	// This error is irreversible, so there is no need to return error
-	ok, _ := verifyGroupKind(ref, ControllerKindDep.Kind, []string{ControllerKindDep.Group})
+	ok, _ := verifyGroupKind(ref.APIVersion, ref.Kind, ControllerKindDep)
 	if !ok {
 		return nil, nil
 	}
@@ -258,7 +298,7 @@ func (r *ControllerFinder) getPodDeployment(ref ControllerReference, namespace s
 
 func (r *ControllerFinder) getPodReplicationController(ref ControllerReference, namespace string) (*ScaleAndSelector, error) {
 	// This error is irreversible, so there is no need to return error
-	ok, _ := verifyGroupKind(ref, ControllerKindRC.Kind, []string{ControllerKindRC.Group})
+	ok, _ := verifyGroupKind(ref.APIVersion, ref.Kind, ControllerKindRC)
 	if !ok {
 		return nil, nil
 	}
@@ -275,8 +315,7 @@ func (r *ControllerFinder) getPodReplicationController(ref ControllerReference, 
 		return nil, nil
 	}
 	return &ScaleAndSelector{
-		Scale:    *(rc.Spec.Replicas),
-		Selector: &metav1.LabelSelector{MatchLabels: rc.Spec.Selector},
+		Scale: *(rc.Spec.Replicas),
 		ControllerReference: ControllerReference{
 			APIVersion: rc.APIVersion,
 			Kind:       rc.Kind,
@@ -290,7 +329,7 @@ func (r *ControllerFinder) getPodReplicationController(ref ControllerReference, 
 // getPodStatefulSet returns the kruise cloneSet referenced by the provided controllerRef.
 func (r *ControllerFinder) getPodKruiseCloneSet(ref ControllerReference, namespace string) (*ScaleAndSelector, error) {
 	// This error is irreversible, so there is no need to return error
-	ok, _ := verifyGroupKind(ref, ControllerKruiseKindCS.Kind, []string{ControllerKruiseKindCS.Group})
+	ok, _ := verifyGroupKind(ref.APIVersion, ref.Kind, ControllerKruiseKindCS)
 	if !ok {
 		return nil, nil
 	}
@@ -323,7 +362,7 @@ func (r *ControllerFinder) getPodKruiseCloneSet(ref ControllerReference, namespa
 // getPodStatefulSet returns the kruise statefulset referenced by the provided controllerRef.
 func (r *ControllerFinder) getPodKruiseStatefulSet(ref ControllerReference, namespace string) (*ScaleAndSelector, error) {
 	// This error is irreversible, so there is no need to return error
-	ok, _ := verifyGroupKind(ref, ControllerKruiseKindSS.Kind, []string{ControllerKruiseKindSS.Group})
+	ok, _ := verifyGroupKind(ref.APIVersion, ref.Kind, ControllerKruiseKindSS)
 	if !ok {
 		return nil, nil
 	}
@@ -341,8 +380,9 @@ func (r *ControllerFinder) getPodKruiseStatefulSet(ref ControllerReference, name
 	}
 
 	return &ScaleAndSelector{
-		Scale:    *(ss.Spec.Replicas),
-		Selector: ss.Spec.Selector,
+		Scale:           *(ss.Spec.Replicas),
+		ReserveOrdinals: ss.Spec.ReserveOrdinals,
+		Selector:        ss.Spec.Selector,
 		ControllerReference: ControllerReference{
 			APIVersion: ss.APIVersion,
 			Kind:       ss.Kind,
@@ -353,21 +393,164 @@ func (r *ControllerFinder) getPodKruiseStatefulSet(ref ControllerReference, name
 	}, nil
 }
 
-func verifyGroupKind(ref ControllerReference, expectedKind string, expectedGroups []string) (bool, error) {
+// getPodStatefulSetLike returns the statefulset like referenced by the provided controllerRef.
+func (r *ControllerFinder) getPodStatefulSetLike(ref ControllerReference, namespace string) (*ScaleAndSelector, error) {
+	// This error is irreversible, so there is no need to return error
 	gv, err := schema.ParseGroupVersion(ref.APIVersion)
+	if err != nil {
+		return nil, nil
+	}
+	whiteList, err := configuration.GetPPSWatchCustomWorkloadWhiteList(r.Client)
+	if err != nil {
+		return nil, err
+	}
+	if !whiteList.ValidateAPIVersionAndKind(ref.APIVersion, ref.Kind) {
+		return nil, nil
+	}
+	gvk := schema.GroupVersionKind{
+		Group:   gv.Group,
+		Version: gv.Version,
+		Kind:    ref.Kind,
+	}
+	workload := &unstructured.Unstructured{}
+	workload.SetGroupVersionKind(gvk)
+	err = r.Get(context.TODO(), client.ObjectKey{Namespace: namespace, Name: ref.Name}, workload)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if ref.UID != "" && workload.GetUID() != ref.UID {
+		return nil, nil
+	}
+
+	scaleSelector := &ScaleAndSelector{
+		Scale:    0,
+		Selector: nil,
+		ControllerReference: ControllerReference{
+			APIVersion: workload.GetAPIVersion(),
+			Kind:       workload.GetKind(),
+			Name:       workload.GetName(),
+			UID:        workload.GetUID(),
+		},
+		Metadata: metav1.ObjectMeta{
+			Namespace:   workload.GetNamespace(),
+			Name:        workload.GetName(),
+			Annotations: workload.GetAnnotations(),
+			UID:         workload.GetUID(),
+		},
+	}
+	if val, err := getSpecReplicas(workload); err == nil {
+		scaleSelector.Scale = val
+	}
+	return scaleSelector, nil
+}
+
+func getSpecReplicas(workload *unstructured.Unstructured) (int32, error) {
+	obj := workload.UnstructuredContent()
+	if val, found, err := unstructured.NestedInt64(obj, "spec", "replicas"); err == nil && found {
+		return int32(val), nil
+	}
+	return 0, nil
+}
+
+func (r *ControllerFinder) getScaleController(ref ControllerReference, namespace string) (*ScaleAndSelector, error) {
+	if isValidGroupVersionKind(ref.APIVersion, ref.Kind) {
+		return nil, nil
+	}
+	gv, err := schema.ParseGroupVersion(ref.APIVersion)
+	if err != nil {
+		return nil, err
+	}
+	gk := schema.GroupKind{
+		Group: gv.Group,
+		Kind:  ref.Kind,
+	}
+	if r.mapper == nil {
+		return nil, nil // only happens in test scenarios, preventing panic
+	}
+	mapping, err := r.mapper.RESTMapping(gk, gv.Version)
+	if err != nil {
+		return nil, err
+	}
+	gr := mapping.Resource.GroupResource()
+	scale, err := r.scaleNamespacer.Scales(namespace).Get(context.TODO(), gr, ref.Name, metav1.GetOptions{})
+	if err != nil {
+		if errors.IsNotFound(err) {
+			// TODO, implementsScale
+			return nil, nil
+		}
+		return nil, err
+	}
+	if ref.UID != "" && scale.UID != ref.UID {
+		return nil, nil
+	}
+	selector, err := metav1.ParseToLabelSelector(scale.Status.Selector)
+	if err != nil {
+		return nil, err
+	}
+	return &ScaleAndSelector{
+		Scale: scale.Spec.Replicas,
+		ControllerReference: ControllerReference{
+			APIVersion: ref.APIVersion,
+			Kind:       ref.Kind,
+			Name:       ref.Name,
+			UID:        scale.UID,
+		},
+		Metadata: scale.ObjectMeta,
+		Selector: selector,
+	}, nil
+}
+
+func (r *ControllerFinder) GetControllerAsUnstructured(ref ControllerReference, namespace string) (*unstructured.Unstructured, error) {
+	un := unstructured.Unstructured{}
+	un.SetAPIVersion(ref.APIVersion)
+	un.SetKind(ref.Kind)
+	return &un, r.Get(context.Background(), client.ObjectKey{Namespace: namespace, Name: ref.Name}, &un)
+}
+
+func (r *ControllerFinder) getRefUID(ref ControllerReference, namespace string) (*ScaleAndSelector, error) {
+	un, err := r.GetControllerAsUnstructured(ref, namespace)
+	if err != nil {
+		return nil, client.IgnoreNotFound(err)
+	}
+	return &ScaleAndSelector{
+		Scale: ReplicasUnknown,
+		ControllerReference: ControllerReference{
+			APIVersion: ref.APIVersion,
+			Kind:       ref.Kind,
+			Name:       ref.Name,
+			UID:        un.GetUID(),
+		},
+		Metadata: metav1.ObjectMeta{
+			Namespace:       un.GetNamespace(),
+			Name:            un.GetName(),
+			Annotations:     un.GetAnnotations(),
+			UID:             un.GetUID(),
+			OwnerReferences: un.GetOwnerReferences(),
+			Labels:          un.GetLabels(),
+			ResourceVersion: un.GetResourceVersion(),
+		},
+	}, nil
+}
+
+func verifyGroupKind(apiVersion, kind string, gvk schema.GroupVersionKind) (bool, error) {
+	gv, err := schema.ParseGroupVersion(apiVersion)
 	if err != nil {
 		return false, err
 	}
+	return gv.Group == gvk.Group && kind == gvk.Kind, nil
+}
 
-	if ref.Kind != expectedKind {
-		return false, nil
-	}
-
-	for _, group := range expectedGroups {
-		if group == gv.Group {
-			return true, nil
+func isValidGroupVersionKind(apiVersion, kind string) bool {
+	for _, gvk := range validWorkloadList {
+		valid, err := verifyGroupKind(apiVersion, kind, gvk)
+		if err != nil {
+			return false
+		} else if valid {
+			return true
 		}
 	}
-
-	return false, nil
+	return false
 }

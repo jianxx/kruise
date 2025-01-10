@@ -245,7 +245,7 @@ var _ = SIGDescribe("ResourceDistribution", func() {
 			for _, cs := range cases {
 				ginkgo.By(cs.name)
 				allNamespaces := cs.getNamespaces()
-				ginkgo.By(fmt.Sprintf("creating namespaces"))
+				ginkgo.By("creating namespaces")
 				tester.CreateNamespaces(allNamespaces...)
 
 				ginkgo.By(fmt.Sprintf("Creating ResourceDistribution %s", resourceDistribution.Name))
@@ -274,7 +274,7 @@ var _ = SIGDescribe("ResourceDistribution", func() {
 				consistentVersion := hex.EncodeToString(md5Hash[:])
 				for namespace := range matchedNamespaces {
 					object, err := tester.GetSecret(namespace, secretName, true)
-					ginkgo.By(fmt.Sprintf("checking distributed secret(%s.%s).", namespace, secretName))
+					ginkgo.By(fmt.Sprintf("checking distributed secret(%s/%s).", namespace, secretName))
 					gomega.Expect(err).NotTo(gomega.HaveOccurred())
 					gomega.Expect(object.GetAnnotations()).ShouldNot(gomega.BeNil())
 					version := object.Annotations[utils.ResourceHashCodeAnnotation]
@@ -329,7 +329,7 @@ var _ = SIGDescribe("ResourceDistribution", func() {
 				ginkgo.By("checking created secrets...")
 				for namespace := range matchedNamespaces {
 					object, err := tester.GetSecret(namespace, secretName, true)
-					ginkgo.By(fmt.Sprintf("checking distributed secret(%s.%s).", namespace, secretName))
+					ginkgo.By(fmt.Sprintf("checking distributed secret(%s/%s).", namespace, secretName))
 					gomega.Expect(err).NotTo(gomega.HaveOccurred())
 					gomega.Expect(object).ShouldNot(gomega.BeNil())
 					version := object.Annotations[utils.ResourceHashCodeAnnotation]

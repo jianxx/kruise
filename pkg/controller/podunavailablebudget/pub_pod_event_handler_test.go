@@ -27,11 +27,13 @@ import (
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+
+	"github.com/openkruise/kruise/pkg/control/pubcontrol"
 )
 
 func TestPodEventHandler(t *testing.T) {
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-	handler := enqueueRequestForPod{client: fakeClient}
+	handler := newEnqueueRequestForPod(fakeClient)
 
 	err := fakeClient.Create(context.TODO(), pubDemo.DeepCopy())
 	if nil != err {
@@ -43,7 +45,8 @@ func TestPodEventHandler(t *testing.T) {
 	createEvt := event.CreateEvent{
 		Object: podDemo.DeepCopy(),
 	}
-	handler.Create(createEvt, createQ)
+	createEvt.Object.SetAnnotations(map[string]string{pubcontrol.PodRelatedPubAnnotation: pubDemo.Name})
+	handler.Create(context.TODO(), createEvt, createQ)
 	if createQ.Len() != 1 {
 		t.Errorf("unexpected create event handle queue size, expected 1 actual %d", createQ.Len())
 	}
@@ -58,7 +61,9 @@ func TestPodEventHandler(t *testing.T) {
 		ObjectOld: podDemo,
 		ObjectNew: newPod,
 	}
-	handler.Update(updateEvent, updateQ)
+	updateEvent.ObjectOld.SetAnnotations(map[string]string{pubcontrol.PodRelatedPubAnnotation: pubDemo.Name})
+	updateEvent.ObjectNew.SetAnnotations(map[string]string{pubcontrol.PodRelatedPubAnnotation: pubDemo.Name})
+	handler.Update(context.TODO(), updateEvent, updateQ)
 	if updateQ.Len() != 1 {
 		t.Errorf("unexpected update event handle queue size, expected 1 actual %d", updateQ.Len())
 	}
@@ -72,7 +77,9 @@ func TestPodEventHandler(t *testing.T) {
 		ObjectOld: podDemo,
 		ObjectNew: newPod,
 	}
-	handler.Update(updateEvent, updateQ)
+	updateEvent.ObjectOld.SetAnnotations(map[string]string{pubcontrol.PodRelatedPubAnnotation: pubDemo.Name})
+	updateEvent.ObjectNew.SetAnnotations(map[string]string{pubcontrol.PodRelatedPubAnnotation: pubDemo.Name})
+	handler.Update(context.TODO(), updateEvent, updateQ)
 	if updateQ.Len() != 0 {
 		t.Errorf("unexpected update event handle queue size, expected 0 actual %d", updateQ.Len())
 	}

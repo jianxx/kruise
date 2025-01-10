@@ -18,6 +18,7 @@ package containerrecreate
 
 import (
 	"encoding/json"
+	"fmt"
 	"time"
 
 	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
@@ -27,6 +28,11 @@ import (
 	"k8s.io/klog/v2"
 	kubeletcontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	utilpointer "k8s.io/utils/pointer"
+)
+
+const (
+	// CRRPodNameIndex is the lookup name for the most comment index function, which is to index by the crr.spec.podName field.
+	CRRPodNameIndex = "podName"
 )
 
 type crrListByPhaseAndCreated []*appsv1alpha1.ContainerRecreateRequest
@@ -79,28 +85,37 @@ func getCurrentCRRContainersRecreateStates(
 		kubeContainerStatus := podStatus.FindContainerStatusByName(c.Name)
 
 		var currentState appsv1alpha1.ContainerRecreateRequestContainerRecreateState
+
 		if kubeContainerStatus == nil {
 			// not found the real container
 			currentState = appsv1alpha1.ContainerRecreateRequestContainerRecreateState{
-				Name:    c.Name,
-				Phase:   appsv1alpha1.ContainerRecreateRequestPending,
-				Message: "not found container on Node",
+				Name:     c.Name,
+				Phase:    appsv1alpha1.ContainerRecreateRequestPending,
+				IsKilled: getPreviousContainerKillState(previousContainerRecreateState),
+				Message:  "not found container on Node",
 			}
 
-		} else if kubeContainerStatus.State != kubeletcontainer.ContainerStateRunning {
+		} else if kubeContainerStatus.State == kubeletcontainer.ContainerStateExited {
 			// for no-running state, we consider it will be recreated or restarted soon
 			currentState = appsv1alpha1.ContainerRecreateRequestContainerRecreateState{
-				Name:  c.Name,
-				Phase: appsv1alpha1.ContainerRecreateRequestRecreating,
+				Name:     c.Name,
+				Phase:    appsv1alpha1.ContainerRecreateRequestRecreating,
+				IsKilled: getPreviousContainerKillState(previousContainerRecreateState),
 			}
-
+		} else if crr.Spec.Strategy.ForceRecreate && (previousContainerRecreateState == nil || !previousContainerRecreateState.IsKilled) {
+			// for forceKill scenarios, when the previous recreate state is empty or has not been killed, the current restart requirement will be set immediately
+			currentState = appsv1alpha1.ContainerRecreateRequestContainerRecreateState{
+				Name:  c.Name,
+				Phase: appsv1alpha1.ContainerRecreateRequestPending,
+			}
 		} else if kubeContainerStatus.ID.String() != c.StatusContext.ContainerID ||
 			kubeContainerStatus.RestartCount > int(c.StatusContext.RestartCount) ||
 			kubeContainerStatus.StartedAt.After(crr.CreationTimestamp.Time) {
 			// already recreated or restarted
 			currentState = appsv1alpha1.ContainerRecreateRequestContainerRecreateState{
-				Name:  c.Name,
-				Phase: appsv1alpha1.ContainerRecreateRequestRecreating,
+				Name:     c.Name,
+				Phase:    appsv1alpha1.ContainerRecreateRequestRecreating,
+				IsKilled: getPreviousContainerKillState(previousContainerRecreateState),
 			}
 			if syncContainerStatus != nil &&
 				syncContainerStatus.ContainerID == kubeContainerStatus.ID.String() &&
@@ -108,11 +123,11 @@ func getCurrentCRRContainersRecreateStates(
 				syncContainerStatus.Ready {
 				currentState.Phase = appsv1alpha1.ContainerRecreateRequestSucceeded
 			}
-
 		} else {
 			currentState = appsv1alpha1.ContainerRecreateRequestContainerRecreateState{
-				Name:  c.Name,
-				Phase: appsv1alpha1.ContainerRecreateRequestPending,
+				Name:     c.Name,
+				Phase:    appsv1alpha1.ContainerRecreateRequestPending,
+				IsKilled: getPreviousContainerKillState(previousContainerRecreateState),
 			}
 		}
 
@@ -120,6 +135,13 @@ func getCurrentCRRContainersRecreateStates(
 	}
 
 	return statuses
+}
+
+func getPreviousContainerKillState(previousContainerRecreateState *appsv1alpha1.ContainerRecreateRequestContainerRecreateState) bool {
+	if previousContainerRecreateState == nil {
+		return false
+	}
+	return previousContainerRecreateState.IsKilled
 }
 
 func getCRRContainerRecreateState(crr *appsv1alpha1.ContainerRecreateRequest, name string) *appsv1alpha1.ContainerRecreateRequestContainerRecreateState {
@@ -139,7 +161,7 @@ func getCRRSyncContainerStatuses(crr *appsv1alpha1.ContainerRecreateRequest) map
 	}
 	var syncContainerStatuses []appsv1alpha1.ContainerRecreateRequestSyncContainerStatus
 	if err := json.Unmarshal([]byte(str), &syncContainerStatuses); err != nil {
-		klog.Errorf("Failed to unmarshal CRR %s/%s syncContainerStatuses %s: %v", crr.Namespace, crr.Name, str, err)
+		klog.ErrorS(err, "Failed to unmarshal CRR syncContainerStatuses", "namespace", crr.Namespace, "name", crr.Name, "rawString", str)
 		return nil
 	}
 
@@ -177,10 +199,23 @@ func convertCRRToPod(crr *appsv1alpha1.ContainerRecreateRequest) *v1.Pod {
 			Ports: crrContainer.Ports,
 		}
 		if crrContainer.PreStop != nil {
-			podContainer.Lifecycle = &v1.Lifecycle{PreStop: crrContainer.PreStop}
+			podContainer.Lifecycle = &v1.Lifecycle{PreStop: &v1.LifecycleHandler{
+				Exec:      crrContainer.PreStop.Exec,
+				HTTPGet:   crrContainer.PreStop.HTTPGet,
+				TCPSocket: crrContainer.PreStop.TCPSocket,
+			}}
 		}
 		pod.Spec.Containers = append(pod.Spec.Containers, podContainer)
 	}
 
 	return pod
+}
+
+// SpecPodNameIndexFunc is a default index function that indexes based on crr.spec.podName
+func SpecPodNameIndexFunc(obj interface{}) ([]string, error) {
+	crr, ok := obj.(*appsv1alpha1.ContainerRecreateRequest)
+	if !ok {
+		return []string{""}, fmt.Errorf("object cannot be convert to CRR")
+	}
+	return []string{crr.Spec.PodName}, nil
 }

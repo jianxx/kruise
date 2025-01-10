@@ -17,24 +17,31 @@ limitations under the License.
 package sidecarcontrol
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"regexp"
 	"strings"
 
+	jsonpatch "github.com/evanphx/json-patch"
 	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
+	"github.com/openkruise/kruise/pkg/features"
 	"github.com/openkruise/kruise/pkg/util"
-
+	utilclient "github.com/openkruise/kruise/pkg/util/client"
+	"github.com/openkruise/kruise/pkg/util/configuration"
+	"github.com/openkruise/kruise/pkg/util/expectations"
+	utilfeature "github.com/openkruise/kruise/pkg/util/feature"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/validation"
-
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/klog/v2"
 	kubecontroller "k8s.io/kubernetes/pkg/controller"
 	"k8s.io/kubernetes/pkg/fieldpath"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 const (
@@ -54,31 +61,45 @@ const (
 	// SidecarsetInplaceUpdateStateKey records the state of inplace-update.
 	// The value of annotation is SidecarsetInplaceUpdateStateKey.
 	SidecarsetInplaceUpdateStateKey string = "kruise.io/sidecarset-inplace-update-state"
+
+	// SidecarSetUpgradable is a pod condition to indicate whether the pod's sidecarset is upgradable
+	SidecarSetUpgradable corev1.PodConditionType = "SidecarSetUpgradable"
 )
 
 var (
 	// SidecarIgnoredNamespaces specifies the namespaces where Pods won't get injected
-	SidecarIgnoredNamespaces = []string{"kube-system", "kube-public"}
+	// SidecarIgnoredNamespaces = []string{"kube-system", "kube-public"}
 	// SubPathExprEnvReg format: $(ODD_NAME)、$(POD_NAME)...
 	SubPathExprEnvReg, _ = regexp.Compile(`\$\(([-._a-zA-Z][-._a-zA-Z0-9]*)\)`)
+
+	UpdateExpectations = expectations.NewUpdateExpectations(RevisionAdapterImpl)
 )
 
 type SidecarSetUpgradeSpec struct {
 	UpdateTimestamp              metav1.Time `json:"updateTimestamp"`
 	SidecarSetHash               string      `json:"hash"`
 	SidecarSetName               string      `json:"sidecarSetName"`
-	SidecarList                  []string    `json:"sidecarList"`        // sidecarSet container list
-	SidecarSetControllerRevision string      `json:"controllerRevision"` // sidecarSet controllerRevision name
+	SidecarList                  []string    `json:"sidecarList"`                  // sidecarSet container list
+	SidecarSetControllerRevision string      `json:"controllerRevision,omitempty"` // sidecarSet controllerRevision name
 }
 
 // PodMatchSidecarSet determines if pod match Selector of sidecar.
-func PodMatchedSidecarSet(pod *corev1.Pod, sidecarSet appsv1alpha1.SidecarSet) (bool, error) {
-	//If matchedNamespace is not empty, sidecarSet will only match the pods in the namespace
-	if sidecarSet.Spec.Namespace != "" && sidecarSet.Spec.Namespace != pod.Namespace {
+func PodMatchedSidecarSet(c client.Client, pod *corev1.Pod, sidecarSet *appsv1alpha1.SidecarSet) (bool, error) {
+	podNamespace := pod.Namespace
+	if podNamespace == "" {
+		podNamespace = "default"
+	}
+	//If Namespace is not empty, sidecarSet will only match the pods in the namespaces
+	if sidecarSet.Spec.Namespace != "" && sidecarSet.Spec.Namespace != podNamespace {
 		return false, nil
 	}
+	if sidecarSet.Spec.NamespaceSelector != nil &&
+		!IsSelectorNamespace(c, podNamespace, sidecarSet.Spec.NamespaceSelector) {
+		return false, nil
+	}
+
 	// if selector not matched, then continue
-	selector, err := metav1.LabelSelectorAsSelector(sidecarSet.Spec.Selector)
+	selector, err := util.ValidatedLabelSelectorAsSelector(sidecarSet.Spec.Selector)
 	if err != nil {
 		return false, err
 	}
@@ -89,13 +110,48 @@ func PodMatchedSidecarSet(pod *corev1.Pod, sidecarSet appsv1alpha1.SidecarSet) (
 	return false, nil
 }
 
+func IsSelectorNamespace(c client.Client, ns string, nsSelector *metav1.LabelSelector) bool {
+	selector, err := util.ValidatedLabelSelectorAsSelector(nsSelector)
+	if err != nil {
+		return false
+	}
+	nsObj := &corev1.Namespace{}
+	err = c.Get(context.TODO(), client.ObjectKey{Name: ns}, nsObj)
+	if err != nil {
+		return false
+	}
+	return selector.Matches(labels.Set(nsObj.Labels))
+}
+
+// FetchSidecarSetMatchedNamespace fetch sidecarSet matched namespaces
+func FetchSidecarSetMatchedNamespace(c client.Client, sidecarSet *appsv1alpha1.SidecarSet) (sets.String, error) {
+	ns := sets.NewString()
+	//If Namespace is not empty, sidecarSet will only match the pods in the namespaces
+	if sidecarSet.Spec.Namespace != "" {
+		return ns.Insert(sidecarSet.Spec.Namespace), nil
+	}
+	// get more faster selector
+	selector, err := util.ValidatedLabelSelectorAsSelector(sidecarSet.Spec.NamespaceSelector)
+	if err != nil {
+		return nil, err
+	}
+	nsList := &corev1.NamespaceList{}
+	if err = c.List(context.TODO(), nsList, &client.ListOptions{LabelSelector: selector}, utilclient.DisableDeepCopy); err != nil {
+		return nil, err
+	}
+	for _, obj := range nsList.Items {
+		ns.Insert(obj.Name)
+	}
+	return ns, nil
+}
+
 // IsActivePod determines the pod whether need be injected and updated
 func IsActivePod(pod *corev1.Pod) bool {
-	for _, namespace := range SidecarIgnoredNamespaces {
+	/*for _, namespace := range SidecarIgnoredNamespaces {
 		if pod.Namespace == namespace {
 			return false
 		}
-	}
+	}*/
 	return kubecontroller.IsPodActive(pod)
 }
 
@@ -126,8 +182,8 @@ func GetPodSidecarSetUpgradeSpecInAnnotations(sidecarSetName, annotationKey stri
 
 	sidecarSetHash := make(map[string]SidecarSetUpgradeSpec)
 	if err := json.Unmarshal([]byte(annotations[hashKey]), &sidecarSetHash); err != nil {
-		klog.Errorf("parse pod(%s.%s) annotations[%s] value(%s) failed: %s", pod.GetNamespace(), pod.GetName(), hashKey,
-			annotations[hashKey], err.Error())
+		klog.ErrorS(err, "Failed to parse pod annotations value", "pod", klog.KObj(pod),
+			"annotations", hashKey, "value", annotations[hashKey])
 		// to be compatible with older sidecarSet hash struct, map[string]string
 		olderSidecarSetHash := make(map[string]string)
 		if err = json.Unmarshal([]byte(annotations[hashKey]), &olderSidecarSetHash); err != nil {
@@ -153,11 +209,12 @@ func IsPodSidecarUpdated(sidecarSet *appsv1alpha1.SidecarSet, pod *corev1.Pod) b
 	return GetSidecarSetRevision(sidecarSet) == GetPodSidecarSetRevision(sidecarSet.Name, pod)
 }
 
-func updatePodSidecarSetHash(pod *corev1.Pod, sidecarSet *appsv1alpha1.SidecarSet) {
+// UpdatePodSidecarSetHash when sidecarSet in-place update sidecar container, Update sidecarSet hash in Pod annotations[kruise.io/sidecarset-hash]
+func UpdatePodSidecarSetHash(pod *corev1.Pod, sidecarSet *appsv1alpha1.SidecarSet) {
 	hashKey := SidecarSetHashAnnotation
 	sidecarSetHash := make(map[string]SidecarSetUpgradeSpec)
 	if err := json.Unmarshal([]byte(pod.Annotations[hashKey]), &sidecarSetHash); err != nil {
-		klog.Errorf("unmarshal pod(%s.%s) annotations[%s] failed: %s", pod.Namespace, pod.Name, hashKey, err.Error())
+		klog.ErrorS(err, "Failed to unmarshal pod annotations", "pod", klog.KObj(pod), "annotations", hashKey)
 
 		// to be compatible with older sidecarSet hash struct, map[string]string
 		olderSidecarSetHash := make(map[string]string)
@@ -185,11 +242,7 @@ func updatePodSidecarSetHash(pod *corev1.Pod, sidecarSet *appsv1alpha1.SidecarSe
 		// compatible done
 	}
 
-	sidecarList := sets.NewString()
-	for _, sidecar := range sidecarSet.Spec.Containers {
-		sidecarList.Insert(sidecar.Name)
-	}
-
+	sidecarList := listSidecarNameInSidecarSet(sidecarSet)
 	sidecarSetHash[sidecarSet.Name] = SidecarSetUpgradeSpec{
 		UpdateTimestamp:              metav1.Now(),
 		SidecarSetHash:               GetSidecarSetRevision(sidecarSet),
@@ -289,7 +342,7 @@ func GetInjectedVolumeMountsAndEnvs(control SidecarControl, sidecarContainer *ap
 				// get envVar in container
 				eVar := util.GetContainerEnvVar(&appContainer, envName)
 				if eVar == nil {
-					klog.Warningf("pod(%s.%s) container(%s) get env(%s) is nil", pod.Namespace, pod.Name, appContainer.Name, envName)
+					klog.InfoS("Pod container got nil env", "pod", klog.KObj(pod), "containerName", appContainer.Name, "env", envName)
 					continue
 				}
 				injectedEnvs = append(injectedEnvs, *eVar)
@@ -324,7 +377,8 @@ func GetSidecarTransferEnvs(sidecarContainer *appsv1alpha1.SidecarContainer, pod
 		if tEnv.SourceContainerNameFrom != nil && tEnv.SourceContainerNameFrom.FieldRef != nil {
 			containerName, err := ExtractContainerNameFromFieldPath(tEnv.SourceContainerNameFrom.FieldRef, pod)
 			if err != nil {
-				klog.Errorf("get containerName from pod(%s.%s) annotations or labels[%s] failed: %s", pod.Namespace, pod.Name, tEnv.SourceContainerNameFrom.FieldRef, err.Error())
+				klog.ErrorS(err, "Failed to get containerName from pod annotations or labels",
+					"pod", klog.KObj(pod), "annotationsOrLabels", tEnv.SourceContainerNameFrom.FieldRef)
 				continue
 			}
 			sourceContainerName = containerName
@@ -334,7 +388,7 @@ func GetSidecarTransferEnvs(sidecarContainer *appsv1alpha1.SidecarContainer, pod
 			env, ok := envsInPod[key]
 			if !ok {
 				// if sourceContainerName is empty or not found in pod.spec.containers
-				klog.Warningf("there is no env %v in container %v", tEnv.EnvName, tEnv.SourceContainerName)
+				klog.InfoS("There was no env in container", "envName", tEnv.EnvName, "containerName", tEnv.SourceContainerName)
 				continue
 			}
 			injectedEnvs = append(injectedEnvs, env)
@@ -388,4 +442,143 @@ func ConvertDownwardAPIFieldLabel(version, label, value string) (string, string,
 		}
 	}
 	return "", "", fmt.Errorf("field label not supported: %s", label)
+}
+
+// PatchPodMetadata patch pod annotations and labels
+func PatchPodMetadata(originMetadata *metav1.ObjectMeta, patches []appsv1alpha1.SidecarSetPatchPodMetadata) (skip bool, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("%v", r)
+		}
+	}()
+	if originMetadata.Annotations == nil {
+		originMetadata.Annotations = map[string]string{}
+	}
+	oldData := originMetadata.DeepCopy()
+	for _, patch := range patches {
+		switch patch.PatchPolicy {
+		case appsv1alpha1.SidecarSetRetainPatchPolicy, "":
+			retainPatchPodMetadata(originMetadata, patch)
+		case appsv1alpha1.SidecarSetOverwritePatchPolicy:
+			overwritePatchPodMetadata(originMetadata, patch)
+		case appsv1alpha1.SidecarSetMergePatchJsonPatchPolicy:
+			if err = mergePatchJsonPodMetadata(originMetadata, patch); err != nil {
+				return
+			}
+		}
+	}
+	if reflect.DeepEqual(oldData.Annotations, originMetadata.Annotations) {
+		skip = true
+	}
+	return
+}
+
+func retainPatchPodMetadata(originMetadata *metav1.ObjectMeta, patchPodField appsv1alpha1.SidecarSetPatchPodMetadata) {
+	for k, v := range patchPodField.Annotations {
+		if _, ok := originMetadata.Annotations[k]; !ok {
+			originMetadata.Annotations[k] = v
+		}
+	}
+}
+
+func overwritePatchPodMetadata(originMetadata *metav1.ObjectMeta, patchPodField appsv1alpha1.SidecarSetPatchPodMetadata) {
+	for k, v := range patchPodField.Annotations {
+		originMetadata.Annotations[k] = v
+	}
+}
+
+func mergePatchJsonPodMetadata(originMetadata *metav1.ObjectMeta, patchPodField appsv1alpha1.SidecarSetPatchPodMetadata) error {
+	for key, patchJSON := range patchPodField.Annotations {
+		if origin, ok := originMetadata.Annotations[key]; ok && origin != "" {
+			modified, err := jsonpatch.MergePatch([]byte(origin), []byte(patchJSON))
+			if err != nil {
+				return err
+			}
+			originMetadata.Annotations[key] = string(modified)
+		} else {
+			originMetadata.Annotations[key] = patchJSON
+		}
+	}
+	return nil
+}
+
+func ValidateSidecarSetPatchMetadataWhitelist(c client.Client, sidecarSet *appsv1alpha1.SidecarSet) error {
+	if len(sidecarSet.Spec.PatchPodMetadata) == 0 {
+		return nil
+	}
+
+	regAnnotations := make([]*regexp.Regexp, 0)
+	whitelist, err := configuration.GetSidecarSetPatchMetadataWhiteList(c)
+	if err != nil {
+		return err
+	} else if whitelist == nil {
+		if utilfeature.DefaultFeatureGate.Enabled(features.SidecarSetPatchPodMetadataDefaultsAllowed) {
+			return nil
+		}
+		return fmt.Errorf("SidecarSet patch metadata whitelist not found")
+	}
+
+	for _, rule := range whitelist.Rules {
+		if rule.Selector != nil {
+			selector, err := util.ValidatedLabelSelectorAsSelector(rule.Selector)
+			if err != nil {
+				return err
+			}
+			if !selector.Matches(labels.Set(sidecarSet.Labels)) {
+				continue
+			}
+		}
+		for _, key := range rule.AllowedAnnotationKeyExprs {
+			reg, err := regexp.Compile(key)
+			if err != nil {
+				return err
+			}
+			regAnnotations = append(regAnnotations, reg)
+		}
+	}
+	if len(regAnnotations) == 0 {
+		if utilfeature.DefaultFeatureGate.Enabled(features.SidecarSetPatchPodMetadataDefaultsAllowed) {
+			return nil
+		}
+		return fmt.Errorf("sidecarSet patch metadata annotation is not allowed")
+	}
+	for _, patch := range sidecarSet.Spec.PatchPodMetadata {
+		for key := range patch.Annotations {
+			if !matchRegKey(key, regAnnotations) {
+				return fmt.Errorf("sidecarSet patch metadata annotation(%s) is not allowed", key)
+			}
+		}
+	}
+	return nil
+}
+
+func matchRegKey(key string, regs []*regexp.Regexp) bool {
+	for _, reg := range regs {
+		if reg.MatchString(key) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsSidecarContainer check whether initContainer is sidecar container in k8s 1.28.
+func IsSidecarContainer(container corev1.Container) bool {
+	if container.RestartPolicy != nil && *container.RestartPolicy == corev1.ContainerRestartPolicyAlways {
+		return true
+	}
+	return false
+}
+
+// listSidecarNameInSidecarSet list always init containers and sidecar containers
+func listSidecarNameInSidecarSet(sidecarSet *appsv1alpha1.SidecarSet) sets.String {
+	sidecarList := sets.NewString()
+	for _, sidecar := range sidecarSet.Spec.InitContainers {
+		if IsSidecarContainer(sidecar.Container) {
+			sidecarList.Insert(sidecar.Name)
+		}
+	}
+	for _, sidecar := range sidecarSet.Spec.Containers {
+		sidecarList.Insert(sidecar.Name)
+	}
+	return sidecarList
 }

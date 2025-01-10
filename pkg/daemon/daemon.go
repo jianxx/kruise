@@ -23,6 +23,19 @@ import (
 	"net/http"
 	"sync"
 
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+
+	kruiseapis "github.com/openkruise/kruise/apis"
+	"github.com/openkruise/kruise/pkg/client"
+	"github.com/openkruise/kruise/pkg/daemon/containermeta"
+	"github.com/openkruise/kruise/pkg/daemon/containerrecreate"
+	daemonruntime "github.com/openkruise/kruise/pkg/daemon/criruntime"
+	"github.com/openkruise/kruise/pkg/daemon/imagepuller"
+	daemonoptions "github.com/openkruise/kruise/pkg/daemon/options"
+	"github.com/openkruise/kruise/pkg/daemon/podprobe"
+	daemonutil "github.com/openkruise/kruise/pkg/daemon/util"
+	"github.com/openkruise/kruise/pkg/features"
+	utilfeature "github.com/openkruise/kruise/pkg/util/feature"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -35,17 +48,6 @@ import (
 	"k8s.io/klog/v2"
 	runtimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
-
-	kruiseapis "github.com/openkruise/kruise/apis"
-	"github.com/openkruise/kruise/pkg/client"
-	"github.com/openkruise/kruise/pkg/daemon/containermeta"
-	"github.com/openkruise/kruise/pkg/daemon/containerrecreate"
-	daemonruntime "github.com/openkruise/kruise/pkg/daemon/criruntime"
-	"github.com/openkruise/kruise/pkg/daemon/imagepuller"
-	daemonoptions "github.com/openkruise/kruise/pkg/daemon/options"
-	daemonutil "github.com/openkruise/kruise/pkg/daemon/util"
-	"github.com/openkruise/kruise/pkg/features"
-	utilfeature "github.com/openkruise/kruise/pkg/util/feature"
 )
 
 const (
@@ -57,8 +59,8 @@ var (
 )
 
 func init() {
-	_ = clientgoscheme.AddToScheme(scheme)
-	_ = kruiseapis.AddToScheme(scheme)
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(kruiseapis.AddToScheme(scheme))
 }
 
 // Runnable allows a component to be started.
@@ -96,7 +98,7 @@ func NewDaemon(cfg *rest.Config, bindAddress string) (Daemon, error) {
 	if err != nil {
 		return nil, err
 	}
-	klog.Infof("Starting daemon on %v ...", nodeName)
+	klog.InfoS("Starting daemon", "nodeName", nodeName)
 
 	listener, err := net.Listen("tcp", bindAddress)
 	if err != nil {
@@ -137,7 +139,7 @@ func NewDaemon(cfg *rest.Config, bindAddress string) (Daemon, error) {
 		Healthz:        healthz,
 	}
 
-	puller, err := imagepuller.NewController(opts, secretManager)
+	puller, err := imagepuller.NewController(opts, secretManager, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to new image puller controller: %v", err)
 	}
@@ -150,6 +152,15 @@ func NewDaemon(cfg *rest.Config, bindAddress string) (Daemon, error) {
 	var runnables = []Runnable{
 		puller,
 		crrController,
+	}
+
+	// node pod probe
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodProbeMarkerGate) {
+		nppController, err := podprobe.NewController(opts)
+		if err != nil {
+			return nil, fmt.Errorf("failed to new nodePodProbe daemon controller: %v", err)
+		}
+		runnables = append(runnables, nppController)
 	}
 
 	if utilfeature.DefaultFeatureGate.Enabled(features.DaemonWatchingPod) {

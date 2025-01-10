@@ -22,11 +22,6 @@ import (
 	"testing"
 	"time"
 
-	appspub "github.com/openkruise/kruise/apis/apps/pub"
-	policyv1alpha1 "github.com/openkruise/kruise/apis/policy/v1alpha1"
-	"github.com/openkruise/kruise/pkg/control/sidecarcontrol"
-	"github.com/openkruise/kruise/pkg/util"
-
 	admissionv1 "k8s.io/api/admission/v1"
 	apps "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -34,17 +29,26 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/tools/record"
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	"k8s.io/kubernetes/pkg/apis/policy"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+
+	appspub "github.com/openkruise/kruise/apis/apps/pub"
+	policyv1alpha1 "github.com/openkruise/kruise/apis/policy/v1alpha1"
+	"github.com/openkruise/kruise/pkg/control/pubcontrol"
+	"github.com/openkruise/kruise/pkg/control/sidecarcontrol"
+	"github.com/openkruise/kruise/pkg/util"
+	"github.com/openkruise/kruise/pkg/util/controllerfinder"
 )
 
 func init() {
 	scheme = runtime.NewScheme()
-	_ = policyv1alpha1.AddToScheme(scheme)
-	_ = corev1.AddToScheme(scheme)
+	utilruntime.Must(policyv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(corev1.AddToScheme(scheme))
 }
 
 var (
@@ -56,8 +60,9 @@ var (
 			Kind:       "PodUnavailableBudget",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "default",
-			Name:      "pub-test",
+			Namespace:   "default",
+			Name:        "pub-test",
+			Annotations: map[string]string{},
 		},
 		Spec: policyv1alpha1.PodUnavailableBudgetSpec{
 			Selector: &metav1.LabelSelector{
@@ -86,10 +91,12 @@ var (
 
 	podDemo = &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        "test-pod-0",
-			Namespace:   "default",
-			Labels:      map[string]string{"app": "pub-controller"},
-			Annotations: map[string]string{},
+			Name:      "test-pod-0",
+			Namespace: "default",
+			Labels:    map[string]string{"app": "pub-controller"},
+			Annotations: map[string]string{
+				pubcontrol.PodRelatedPubAnnotation: pubDemo.Name,
+			},
 		},
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{
@@ -352,11 +359,13 @@ func TestValidateUpdatePodForPub(t *testing.T) {
 			name: "valid update pod, no matched pub, allow",
 			oldPod: func() *corev1.Pod {
 				pod := podDemo.DeepCopy()
+				delete(pod.Annotations, pubcontrol.PodRelatedPubAnnotation)
 				return pod
 			},
 			newPod: func() *corev1.Pod {
 				pod := podDemo.DeepCopy()
 				pod.Labels["app"] = "no-pub"
+				delete(pod.Annotations, pubcontrol.PodRelatedPubAnnotation)
 				pod.Spec.Containers[0].Image = "nginx:1.18"
 				return pod
 			},
@@ -417,16 +426,63 @@ func TestValidateUpdatePodForPub(t *testing.T) {
 				return pubStatus
 			},
 		},
+		{
+			name: "valid update pod, pub feature-gate annotation, allow",
+			oldPod: func() *corev1.Pod {
+				pod := podDemo.DeepCopy()
+				return pod
+			},
+			newPod: func() *corev1.Pod {
+				pod := podDemo.DeepCopy()
+				pod.Spec.Containers[0].Image = "nginx:1.18"
+				return pod
+			},
+			pub: func() *policyv1alpha1.PodUnavailableBudget {
+				pub := pubDemo.DeepCopy()
+				pub.Annotations[policyv1alpha1.PubProtectOperationAnnotation] = "DELETE"
+				return pub
+			},
+			expectAllow: true,
+			expectPubStatus: func() *policyv1alpha1.PodUnavailableBudgetStatus {
+				pubStatus := pubDemo.Status.DeepCopy()
+				return pubStatus
+			},
+		},
+		{
+			name: "valid update pod, pub feature-gate annotation, reject",
+			oldPod: func() *corev1.Pod {
+				pod := podDemo.DeepCopy()
+				return pod
+			},
+			newPod: func() *corev1.Pod {
+				pod := podDemo.DeepCopy()
+				pod.Spec.Containers[0].Image = "nginx:1.18"
+				return pod
+			},
+			pub: func() *policyv1alpha1.PodUnavailableBudget {
+				pub := pubDemo.DeepCopy()
+				pub.Annotations[policyv1alpha1.PubProtectOperationAnnotation] = "UPDATE"
+				return pub
+			},
+			expectAllow: false,
+			expectPubStatus: func() *policyv1alpha1.PodUnavailableBudgetStatus {
+				pubStatus := pubDemo.Status.DeepCopy()
+				return pubStatus
+			},
+		},
 	}
 
 	for _, cs := range cases {
 		t.Run(cs.name, func(t *testing.T) {
-			decoder, _ := admission.NewDecoder(scheme)
-			fClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cs.pub()).Build()
+			decoder := admission.NewDecoder(scheme)
+			fClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cs.pub()).
+				WithStatusSubresource(&policyv1alpha1.PodUnavailableBudget{}).Build()
 			podHandler := PodCreateHandler{
 				Client:  fClient,
 				Decoder: decoder,
 			}
+			finder := &controllerfinder.ControllerFinder{Client: fClient}
+			pubcontrol.InitPubControl(fClient, finder, record.NewFakeRecorder(10))
 			oldPodRaw := runtime.RawExtension{
 				Raw: []byte(util.DumpJSON(cs.oldPod())),
 			}
@@ -574,16 +630,56 @@ func TestValidateEvictPodForPub(t *testing.T) {
 				return pubStatus
 			},
 		},
+		{
+			name: "evict pod, allow",
+			eviction: func() *policy.Eviction {
+				return &policy.Eviction{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-pod-0",
+						Namespace: "default",
+					},
+					DeleteOptions: &metav1.DeleteOptions{},
+				}
+			},
+			newPod: func() *corev1.Pod {
+				podIn := podDemo.DeepCopy()
+				return podIn
+			},
+			pub: func() *policyv1alpha1.PodUnavailableBudget {
+				pub := pubDemo.DeepCopy()
+				pub.Status = policyv1alpha1.PodUnavailableBudgetStatus{
+					TotalReplicas:      0,
+					DesiredAvailable:   0,
+					CurrentAvailable:   10,
+					UnavailableAllowed: 0,
+				}
+				return pub
+			},
+			subresource: "eviction",
+			expectAllow: true,
+			expectPubStatus: func() *policyv1alpha1.PodUnavailableBudgetStatus {
+				pubStatus := &policyv1alpha1.PodUnavailableBudgetStatus{
+					TotalReplicas:      0,
+					DesiredAvailable:   0,
+					CurrentAvailable:   10,
+					UnavailableAllowed: 0,
+				}
+				return pubStatus
+			},
+		},
 	}
 
 	for _, cs := range cases {
 		t.Run(cs.name, func(t *testing.T) {
-			decoder, _ := admission.NewDecoder(scheme)
-			fClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cs.pub(), cs.newPod()).Build()
+			decoder := admission.NewDecoder(scheme)
+			fClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cs.pub(), cs.newPod()).
+				WithStatusSubresource(&policyv1alpha1.PodUnavailableBudget{}).Build()
 			podHandler := PodCreateHandler{
 				Client:  fClient,
 				Decoder: decoder,
 			}
+			finder := &controllerfinder.ControllerFinder{Client: fClient}
+			pubcontrol.InitPubControl(fClient, finder, record.NewFakeRecorder(10))
 			evictionRaw := runtime.RawExtension{
 				Raw: []byte(util.DumpJSON(cs.eviction())),
 			}
@@ -658,6 +754,27 @@ func TestValidateDeletePodForPub(t *testing.T) {
 			},
 		},
 		{
+			name: "delete pod, pub feature-gate annotation, allow",
+			deletion: func() *metav1.DeleteOptions {
+				return &metav1.DeleteOptions{}
+			},
+			newPod: func() *corev1.Pod {
+				podIn := podDemo.DeepCopy()
+				return podIn
+			},
+			pub: func() *policyv1alpha1.PodUnavailableBudget {
+				pub := pubDemo.DeepCopy()
+				pub.Annotations[policyv1alpha1.PubProtectOperationAnnotation] = "UPDATE"
+				return pub
+			},
+			subresource: "",
+			expectAllow: true,
+			expectPubStatus: func() *policyv1alpha1.PodUnavailableBudgetStatus {
+				pubStatus := pubDemo.Status.DeepCopy()
+				return pubStatus
+			},
+		},
+		{
 			name: "delete pod, allow",
 			newPod: func() *corev1.Pod {
 				podIn := podDemo.DeepCopy()
@@ -712,12 +829,15 @@ func TestValidateDeletePodForPub(t *testing.T) {
 
 	for _, cs := range cases {
 		t.Run(cs.name, func(t *testing.T) {
-			decoder, _ := admission.NewDecoder(scheme)
-			fClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cs.pub(), cs.newPod()).Build()
+			decoder := admission.NewDecoder(scheme)
+			fClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cs.pub(), cs.newPod()).
+				WithStatusSubresource(&policyv1alpha1.PodUnavailableBudget{}).Build()
 			podHandler := PodCreateHandler{
 				Client:  fClient,
 				Decoder: decoder,
 			}
+			finder := &controllerfinder.ControllerFinder{Client: fClient}
+			pubcontrol.InitPubControl(fClient, finder, record.NewFakeRecorder(10))
 			deletionRaw := runtime.RawExtension{
 				Raw: []byte(util.DumpJSON(cs.deletion())),
 			}

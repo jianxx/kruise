@@ -20,13 +20,6 @@ import (
 	"context"
 	"flag"
 
-	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
-	"github.com/openkruise/kruise/pkg/control/sidecarcontrol"
-	"github.com/openkruise/kruise/pkg/util"
-	utildiscovery "github.com/openkruise/kruise/pkg/util/discovery"
-	"github.com/openkruise/kruise/pkg/util/expectations"
-	"github.com/openkruise/kruise/pkg/util/ratelimiter"
-
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -39,6 +32,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
+
+	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
+	"github.com/openkruise/kruise/pkg/util"
+	utilclient "github.com/openkruise/kruise/pkg/util/client"
+	utildiscovery "github.com/openkruise/kruise/pkg/util/discovery"
+	"github.com/openkruise/kruise/pkg/util/ratelimiter"
 )
 
 func init() {
@@ -66,13 +65,12 @@ func Add(mgr manager.Manager) error {
 
 // newReconciler returns a new reconcile.Reconciler
 func newReconciler(mgr manager.Manager) reconcile.Reconciler {
-	expectations := expectations.NewUpdateExpectations(sidecarcontrol.RevisionAdapterImpl)
 	recorder := mgr.GetEventRecorderFor("sidecarset-controller")
-	cli := util.NewClientFromManager(mgr, "sidecarset-controller")
+	cli := utilclient.NewClientFromManager(mgr, "sidecarset-controller")
 	return &ReconcileSidecarSet{
 		Client:    cli,
 		scheme:    mgr.GetScheme(),
-		processor: NewSidecarSetProcessor(cli, expectations, recorder),
+		processor: NewSidecarSetProcessor(cli, recorder),
 	}
 }
 
@@ -80,19 +78,19 @@ func newReconciler(mgr manager.Manager) reconcile.Reconciler {
 func add(mgr manager.Manager, r reconcile.Reconciler) error {
 	// Create a new controller
 	c, err := controller.New("sidecarset-controller", mgr, controller.Options{
-		Reconciler: r, MaxConcurrentReconciles: concurrentReconciles,
+		Reconciler: r, MaxConcurrentReconciles: concurrentReconciles, CacheSyncTimeout: util.GetControllerCacheSyncTimeout(),
 		RateLimiter: ratelimiter.DefaultControllerRateLimiter()})
 	if err != nil {
 		return err
 	}
 
 	// Watch for changes to SidecarSet
-	err = c.Watch(&source.Kind{Type: &appsv1alpha1.SidecarSet{}}, &handler.EnqueueRequestForObject{}, predicate.Funcs{
+	err = c.Watch(source.Kind(mgr.GetCache(), &appsv1alpha1.SidecarSet{}), &handler.EnqueueRequestForObject{}, predicate.Funcs{
 		UpdateFunc: func(e event.UpdateEvent) bool {
 			oldScS := e.ObjectOld.(*appsv1alpha1.SidecarSet)
 			newScS := e.ObjectNew.(*appsv1alpha1.SidecarSet)
 			if oldScS.GetGeneration() != newScS.GetGeneration() {
-				klog.V(3).Infof("Observed updated Spec for SidecarSet: %s/%s", newScS.GetNamespace(), newScS.GetName())
+				klog.V(3).InfoS("Observed updated Spec for SidecarSet", "sidecarSet", klog.KObj(newScS))
 				return true
 			}
 			return false
@@ -103,7 +101,7 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 	}
 
 	// Watch for changes to Pod
-	if err = c.Watch(&source.Kind{Type: &corev1.Pod{}}, &enqueueRequestForPod{reader: mgr.GetCache()}); err != nil {
+	if err = c.Watch(source.Kind(mgr.GetCache(), &corev1.Pod{}), &enqueueRequestForPod{reader: mgr.GetCache()}); err != nil {
 		return err
 	}
 
@@ -115,13 +113,13 @@ var _ reconcile.Reconciler = &ReconcileSidecarSet{}
 // ReconcileSidecarSet reconciles a SidecarSet object
 type ReconcileSidecarSet struct {
 	client.Client
-	scheme             *runtime.Scheme
-	updateExpectations expectations.UpdateExpectations
-	processor          *Processor
+	scheme    *runtime.Scheme
+	processor *Processor
 }
 
 // +kubebuilder:rbac:groups=apps.kruise.io,resources=sidecarsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps.kruise.io,resources=sidecarsets/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=apps.kruise.io,resources=sidecarsets/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=controllerrevisions,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile reads that state of the cluster for a SidecarSet object and makes changes based on the state read
@@ -140,6 +138,6 @@ func (r *ReconcileSidecarSet) Reconcile(_ context.Context, request reconcile.Req
 		return reconcile.Result{}, err
 	}
 
-	klog.V(3).Infof("begin to process sidecarset %v for reconcile", sidecarSet.Name)
+	klog.V(3).InfoS("Began to process sidecarset for reconcile", "sidecarSet", klog.KObj(sidecarSet))
 	return r.processor.UpdateSidecarSet(sidecarSet)
 }

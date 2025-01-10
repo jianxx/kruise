@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+	http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,12 +19,17 @@ import (
 	"strconv"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/json"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
@@ -108,7 +113,7 @@ var (
 
 func init() {
 	scheme = runtime.NewScheme()
-	_ = appsv1alpha1.AddToScheme(scheme)
+	utilruntime.Must(appsv1alpha1.AddToScheme(scheme))
 }
 
 func TestValidateWorkloadSpreadCreate(t *testing.T) {
@@ -172,6 +177,84 @@ func TestValidateWorkloadSpreadCreate(t *testing.T) {
 				},
 				ScheduleStrategy: appsv1alpha1.WorkloadSpreadScheduleStrategy{
 					Type: appsv1alpha1.FixedWorkloadSpreadScheduleStrategyType,
+				},
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "ws-1", Namespace: metav1.NamespaceDefault},
+			Spec: appsv1alpha1.WorkloadSpreadSpec{
+				TargetReference: &appsv1alpha1.TargetReference{
+					APIVersion: "apps/v1",
+					Kind:       "StatefulSet",
+					Name:       "demo",
+				},
+				Subsets: []appsv1alpha1.WorkloadSpreadSubset{
+					{
+						Name:        "subset-a",
+						MaxReplicas: &replicas1,
+						Patch: runtime.RawExtension{
+							Raw: []byte(`{"metadata":{"annotations":{"subset":"subset-a"}}}`),
+						},
+					},
+					{
+						Name:        "subset-b",
+						MaxReplicas: nil,
+						Patch: runtime.RawExtension{
+							Raw: []byte(`{"metadata":{"annotations":{"subset":"subset-b"}}}`),
+						},
+					},
+				},
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "ws-1", Namespace: metav1.NamespaceDefault},
+			Spec: appsv1alpha1.WorkloadSpreadSpec{
+				TargetReference: &appsv1alpha1.TargetReference{
+					APIVersion: "apps.kruise.io/v1alpha1",
+					Kind:       "StatefulSet",
+					Name:       "demo",
+				},
+				Subsets: []appsv1alpha1.WorkloadSpreadSubset{
+					{
+						Name:        "subset-a",
+						MaxReplicas: &replicas1,
+						Patch: runtime.RawExtension{
+							Raw: []byte(`{"metadata":{"annotations":{"subset":"subset-a"}}}`),
+						},
+					},
+					{
+						Name:        "subset-b",
+						MaxReplicas: nil,
+						Patch: runtime.RawExtension{
+							Raw: []byte(`{"metadata":{"annotations":{"subset":"subset-b"}}}`),
+						},
+					},
+				},
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "ws-1", Namespace: metav1.NamespaceDefault},
+			Spec: appsv1alpha1.WorkloadSpreadSpec{
+				TargetReference: &appsv1alpha1.TargetReference{
+					APIVersion: "apps.kruise.io/v1beta1",
+					Kind:       "StatefulSet",
+					Name:       "demo",
+				},
+				Subsets: []appsv1alpha1.WorkloadSpreadSubset{
+					{
+						Name:        "subset-a",
+						MaxReplicas: &replicas1,
+						Patch: runtime.RawExtension{
+							Raw: []byte(`{"metadata":{"annotations":{"subset":"subset-a"}}}`),
+						},
+					},
+					{
+						Name:        "subset-b",
+						MaxReplicas: nil,
+						Patch: runtime.RawExtension{
+							Raw: []byte(`{"metadata":{"annotations":{"subset":"subset-b"}}}`),
+						},
+					},
 				},
 			},
 		},
@@ -436,7 +519,35 @@ func TestValidateWorkloadSpreadCreate(t *testing.T) {
 			},
 			errorSuffix: "spec.subsets",
 		},
-		//{
+		{
+			name: "statefulset group error",
+			getWorkloadSpread: func() *appsv1alpha1.WorkloadSpread {
+				workloadSpread := workloadSpreadDemo.DeepCopy()
+				workloadSpread.Spec.TargetReference = &appsv1alpha1.TargetReference{
+					APIVersion: "rollouts.kruise.io/v2",
+					Kind:       "StatefulSet",
+					Name:       "demo",
+				}
+				return workloadSpread
+			},
+			errorSuffix: "spec.targetRef",
+		},
+		{
+			name: "statefulset subset is percentage",
+			getWorkloadSpread: func() *appsv1alpha1.WorkloadSpread {
+				workloadSpread := workloadSpreadDemo.DeepCopy()
+				workloadSpread.Spec.TargetReference = &appsv1alpha1.TargetReference{
+					APIVersion: "apps.kruise.io/v1beta1",
+					Kind:       "StatefulSet",
+					Name:       "demo",
+				}
+				workloadSpread.Spec.Subsets[0].MaxReplicas = &replicas2
+				return workloadSpread
+			},
+			errorSuffix: "spec.subsets[0].maxReplicas",
+		},
+
+		// {
 		//	name: "one subset",
 		//	getWorkloadSpread: func() *appsv1alpha1.WorkloadSpread {
 		//		workloadSpread := workloadSpreadDemo.DeepCopy()
@@ -449,7 +560,7 @@ func TestValidateWorkloadSpreadCreate(t *testing.T) {
 		//		return workloadSpread
 		//	},
 		//	errorSuffix: "spec.subsets",
-		//},
+		// },
 		{
 			name: "subset[0]'name is empty",
 			getWorkloadSpread: func() *appsv1alpha1.WorkloadSpread {
@@ -477,7 +588,7 @@ func TestValidateWorkloadSpreadCreate(t *testing.T) {
 			},
 			errorSuffix: "spec.subsets[1].name",
 		},
-		//{
+		// {
 		//	name: "subset[0]'s requiredNodeSelectorTerm, preferredNodeSelectorTerms and tolerations are all empty",
 		//	getWorkloadSpread: func() *appsv1alpha1.WorkloadSpread {
 		//		workloadSpread := workloadSpreadDemo.DeepCopy()
@@ -487,7 +598,7 @@ func TestValidateWorkloadSpreadCreate(t *testing.T) {
 		//		return workloadSpread
 		//	},
 		//	errorSuffix: "spec.subsets[0].requiredNodeSelectorTerm",
-		//},
+		// },
 		{
 			name: "requiredNodeSelectorTerm are not valid",
 			getWorkloadSpread: func() *appsv1alpha1.WorkloadSpread {
@@ -832,6 +943,174 @@ func TestValidateWorkloadSpreadConflict(t *testing.T) {
 			if allErrors[0].Field != errorSuffix {
 				t.Errorf("%s: missing prefix for: %v", errorSuffix, allErrors)
 			}
+		})
+	}
+}
+
+func Test_validateWorkloadSpreadSubsets(t *testing.T) {
+	cloneset := &appsv1alpha1.CloneSet{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "CloneSet",
+			APIVersion: "apps.kruise.io/v1alpha1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-cs",
+		},
+		Spec: appsv1alpha1.CloneSetSpec{
+			Replicas: ptr.To(int32(6)),
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"app": "test",
+				},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"app": "test",
+					},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name:  "main",
+							Image: "img:latest",
+							VolumeMounts: []corev1.VolumeMount{
+								{
+									Name:      "vol-1--0",
+									MountPath: "/logs",
+									SubPath:   "logs",
+								},
+							},
+						},
+					},
+				},
+			},
+			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "vol-1--0",
+					},
+				},
+			},
+		},
+	}
+
+	sts := &appsv1.StatefulSet{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "StatefulSet",
+			APIVersion: "apps/v1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-sts",
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: ptr.To(int32(6)),
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"app": "nginx",
+				},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"app": "nginx",
+					},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name:  "main",
+							Image: "img:latest",
+							VolumeMounts: []corev1.VolumeMount{
+								{
+									Name:      "vol-1--0",
+									MountPath: "/logs",
+									SubPath:   "logs",
+								},
+							},
+						},
+					},
+				},
+			},
+			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "vol-1--0",
+					},
+				},
+			},
+		},
+	}
+	patchData := map[string]any{
+		"metadata": map[string]any{
+			"annotations": map[string]any{
+				"some-key": "some-value",
+			},
+		},
+	}
+	patch, _ := json.Marshal(patchData)
+	ws := &appsv1alpha1.WorkloadSpread{
+		Spec: appsv1alpha1.WorkloadSpreadSpec{
+			Subsets: []appsv1alpha1.WorkloadSpreadSubset{
+				{
+					Name: "test",
+					Patch: runtime.RawExtension{
+						Raw: patch,
+					},
+				},
+			},
+		},
+	}
+
+	badCloneSet := cloneset.DeepCopy()
+	badCloneSet.Spec.VolumeClaimTemplates[0].Name = "bad-boy"
+	badSts := sts.DeepCopy()
+	badSts.Spec.VolumeClaimTemplates[0].Name = "bad-boy"
+
+	testCases := []struct {
+		name     string
+		workload client.Object
+		testFunc func(errList field.ErrorList)
+	}{
+		{
+			name:     "good cloneset",
+			workload: cloneset,
+			testFunc: func(errList field.ErrorList) {
+				if len(errList) != 0 {
+					t.Fatalf("expected 0 error, got %d, errList = %+v", len(errList), errList)
+				}
+			},
+		}, {
+			name:     "bad cloneset",
+			workload: badCloneSet,
+			testFunc: func(errList field.ErrorList) {
+				if len(errList) != 1 {
+					t.Fatalf("expected 1 error, got %d, errList = %+v", len(errList), errList)
+				}
+			},
+		}, {
+			name:     "good sts",
+			workload: sts,
+			testFunc: func(errList field.ErrorList) {
+				if len(errList) != 0 {
+					t.Fatalf("expected 0 error, got %d, errList = %+v", len(errList), errList)
+				}
+			},
+		}, {
+			name:     "bad sts",
+			workload: badSts,
+			testFunc: func(errList field.ErrorList) {
+				if len(errList) != 1 {
+					t.Fatalf("expected 1 error, got %d, errList = %+v", len(errList), errList)
+				}
+			},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.testFunc(
+				validateWorkloadSpreadSubsets(ws, ws.Spec.Subsets, tc.workload, field.NewPath("spec").Child("subsets")),
+			)
 		})
 	}
 }

@@ -22,8 +22,6 @@ import (
 )
 
 const (
-	// [Immutable] Pod name of this ContainerRecreateRequest.
-	ContainerRecreateRequestPodNameKey = "crr.apps.kruise.io/pod-name"
 	// [Immutable] Pod UID of this ContainerRecreateRequest.
 	ContainerRecreateRequestPodUIDKey = "crr.apps.kruise.io/pod-uid"
 	// [Immutable] Node name of this ContainerRecreateRequest.
@@ -46,7 +44,9 @@ type ContainerRecreateRequestSpec struct {
 	// PodName is name of the Pod that owns the recreated containers.
 	PodName string `json:"podName"`
 	// Containers contains the containers that need to recreate in the Pod.
-	Containers []ContainerRecreateRequestContainer `json:"containers"`
+	// +patchMergeKey=name
+	// +patchStrategy=merge
+	Containers []ContainerRecreateRequestContainer `json:"containers" patchStrategy:"merge" patchMergeKey:"name"`
 	// Strategy defines strategies for containers recreation.
 	Strategy *ContainerRecreateRequestStrategy `json:"strategy,omitempty"`
 	// ActiveDeadlineSeconds is the deadline duration of this ContainerRecreateRequest.
@@ -63,7 +63,7 @@ type ContainerRecreateRequestContainer struct {
 	// PreStop is synced from the real container in Pod spec during this ContainerRecreateRequest creating.
 	// Populated by the system.
 	// Read-only.
-	PreStop *v1.Handler `json:"preStop,omitempty"`
+	PreStop *ProbeHandler `json:"preStop,omitempty"`
 	// Ports is synced from the real container in Pod spec during this ContainerRecreateRequest creating.
 	// Populated by the system.
 	// Read-only.
@@ -72,6 +72,23 @@ type ContainerRecreateRequestContainer struct {
 	// Populated by the system.
 	// Read-only.
 	StatusContext *ContainerRecreateRequestContainerContext `json:"statusContext,omitempty"`
+}
+
+// ProbeHandler defines a specific action that should be taken
+// TODO(FillZpp): improve the definition when openkruise/kruise updates to k8s 1.23
+type ProbeHandler struct {
+	// One and only one of the following should be specified.
+	// Exec specifies the action to take.
+	// +optional
+	Exec *v1.ExecAction `json:"exec,omitempty" protobuf:"bytes,1,opt,name=exec"`
+	// HTTPGet specifies the http request to perform.
+	// +optional
+	HTTPGet *v1.HTTPGetAction `json:"httpGet,omitempty" protobuf:"bytes,2,opt,name=httpGet"`
+	// TCPSocket specifies an action involving a TCP port.
+	// TCP hooks not yet supported
+	// TODO: implement a realistic TCP lifecycle hook
+	// +optional
+	TCPSocket *v1.TCPSocketAction `json:"tcpSocket,omitempty" protobuf:"bytes,3,opt,name=tcpSocket"`
 }
 
 // ContainerRecreateRequestContainerContext contains context status of the container that need to recreate.
@@ -91,6 +108,8 @@ type ContainerRecreateRequestStrategy struct {
 	FailurePolicy ContainerRecreateRequestFailurePolicyType `json:"failurePolicy,omitempty"`
 	// OrderedRecreate indicates whether to recreate the next container only if the previous one has recreated completely.
 	OrderedRecreate bool `json:"orderedRecreate,omitempty"`
+	// ForceRecreate indicates whether to force kill the container even if the previous container is starting.
+	ForceRecreate bool `json:"forceRecreate,omitempty"`
 	// TerminationGracePeriodSeconds is the optional duration in seconds to wait the container terminating gracefully.
 	// Value must be non-negative integer. The value zero indicates delete immediately.
 	// If this value is nil, we will use pod.Spec.TerminationGracePeriodSeconds as default value.
@@ -143,6 +162,8 @@ type ContainerRecreateRequestContainerRecreateState struct {
 	Phase ContainerRecreateRequestPhase `json:"phase"`
 	// A human readable message indicating details about this state.
 	Message string `json:"message,omitempty"`
+	// Containers are killed by kruise daemon
+	IsKilled bool `json:"isKilled,omitempty"`
 }
 
 // ContainerRecreateRequestSyncContainerStatus only uses in the annotation `crr.apps.kruise.io/sync-container-statuses`.

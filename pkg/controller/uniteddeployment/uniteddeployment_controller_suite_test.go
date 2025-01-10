@@ -24,6 +24,8 @@ import (
 	"sync"
 	"testing"
 
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+
 	"github.com/onsi/gomega"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -40,7 +42,7 @@ func TestMain(m *testing.M) {
 	t := &envtest.Environment{
 		CRDDirectoryPaths: []string{filepath.Join("..", "..", "..", "config", "crd", "bases")},
 	}
-	apis.AddToScheme(scheme.Scheme)
+	utilruntime.Must(apis.AddToScheme(scheme.Scheme))
 
 	var err error
 	if cfg, err = t.Start(); err != nil {
@@ -58,7 +60,10 @@ func SetupTestReconcile(inner reconcile.Reconciler) (reconcile.Reconciler, chan 
 	requests := make(chan reconcile.Request)
 	fn := reconcile.Func(func(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 		result, err := inner.Reconcile(ctx, req)
-		requests <- req
+		select {
+		case <-ctx.Done():
+		case requests <- req:
+		}
 		return result, err
 	})
 	return fn, requests

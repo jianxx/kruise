@@ -6,17 +6,20 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/openkruise/kruise/apis"
-	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+
 	"gomodules.xyz/jsonpatch/v2"
 	admissionv1 "k8s.io/api/admission/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+
+	"github.com/openkruise/kruise/apis"
+	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
 )
 
 func TestHandle(t *testing.T) {
-	_ = apis.AddToScheme(scheme.Scheme)
+	utilruntime.Must(apis.AddToScheme(scheme.Scheme))
 
 	oldBroadcastJobStr := `{
     "metadata": {
@@ -48,7 +51,7 @@ func TestHandle(t *testing.T) {
     }
 }`
 
-	decoder, _ := admission.NewDecoder(scheme.Scheme)
+	decoder := admission.NewDecoder(scheme.Scheme)
 	handler := BroadcastJobCreateUpdateHandler{
 		Decoder: decoder,
 	}

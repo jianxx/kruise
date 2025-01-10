@@ -66,10 +66,18 @@ func (f *sharedInformerFactory) ForResource(resource schema.GroupVersionResource
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Apps().V1alpha1().DaemonSets().Informer()}, nil
 	case v1alpha1.SchemeGroupVersion.WithResource("ephemeraljobs"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Apps().V1alpha1().EphemeralJobs().Informer()}, nil
+	case v1alpha1.SchemeGroupVersion.WithResource("imagelistpulljobs"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Apps().V1alpha1().ImageListPullJobs().Informer()}, nil
 	case v1alpha1.SchemeGroupVersion.WithResource("imagepulljobs"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Apps().V1alpha1().ImagePullJobs().Informer()}, nil
 	case v1alpha1.SchemeGroupVersion.WithResource("nodeimages"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Apps().V1alpha1().NodeImages().Informer()}, nil
+	case v1alpha1.SchemeGroupVersion.WithResource("nodepodprobes"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Apps().V1alpha1().NodePodProbes().Informer()}, nil
+	case v1alpha1.SchemeGroupVersion.WithResource("persistentpodstates"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Apps().V1alpha1().PersistentPodStates().Informer()}, nil
+	case v1alpha1.SchemeGroupVersion.WithResource("podprobemarkers"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Apps().V1alpha1().PodProbeMarkers().Informer()}, nil
 	case v1alpha1.SchemeGroupVersion.WithResource("resourcedistributions"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Apps().V1alpha1().ResourceDistributions().Informer()}, nil
 	case v1alpha1.SchemeGroupVersion.WithResource("sidecarsets"):

@@ -88,7 +88,7 @@ We encourage contributors to follow the [PR template](./.github/PULL_REQUEST_TEM
 As a contributor, if you want to make any contribution to Kruise project, we should reach an agreement on the version of tools used in the development environment.
 Here are some dependents with specific version:
 
-- Golang : v1.15+ (1.17 is best)
+- Golang : v1.18+
 - Kubernetes: v1.16+
 
 ### Developing guide
@@ -111,6 +111,23 @@ make test
 ### Proposals
 
 If you are going to contribute a feature with new API or needs significant effort, please submit a proposal in [./docs/proposals/](./docs/proposals) first.
+
+### Kruise Helm Charts
+[kruise charts](https://github.com/openkruise/charts) is openKruise charts repo, include kruise, kruise rollout, kruise game.
+You can add the corresponding charts package in the versions directory as follows:
+```
+ versions
+ - kruise-game
+ - kruise-rollout
+ - kruise-state-metrics
+ - kruise
+   - 1.5.0
+   - 1.5.1
+   - 1.6.0
+   - 1.6.1
+```
+
+**make generate_helm_crds** automatically generates crds files under the bin/ directory, which in turn simplifies the generation of helm charts.
 
 ## Engage to help anything
 

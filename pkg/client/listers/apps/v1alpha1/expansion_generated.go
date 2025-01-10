@@ -65,6 +65,14 @@ type EphemeralJobListerExpansion interface{}
 // EphemeralJobNamespaceLister.
 type EphemeralJobNamespaceListerExpansion interface{}
 
+// ImageListPullJobListerExpansion allows custom methods to be added to
+// ImageListPullJobLister.
+type ImageListPullJobListerExpansion interface{}
+
+// ImageListPullJobNamespaceListerExpansion allows custom methods to be added to
+// ImageListPullJobNamespaceLister.
+type ImageListPullJobNamespaceListerExpansion interface{}
+
 // ImagePullJobListerExpansion allows custom methods to be added to
 // ImagePullJobLister.
 type ImagePullJobListerExpansion interface{}
@@ -76,6 +84,26 @@ type ImagePullJobNamespaceListerExpansion interface{}
 // NodeImageListerExpansion allows custom methods to be added to
 // NodeImageLister.
 type NodeImageListerExpansion interface{}
+
+// NodePodProbeListerExpansion allows custom methods to be added to
+// NodePodProbeLister.
+type NodePodProbeListerExpansion interface{}
+
+// PersistentPodStateListerExpansion allows custom methods to be added to
+// PersistentPodStateLister.
+type PersistentPodStateListerExpansion interface{}
+
+// PersistentPodStateNamespaceListerExpansion allows custom methods to be added to
+// PersistentPodStateNamespaceLister.
+type PersistentPodStateNamespaceListerExpansion interface{}
+
+// PodProbeMarkerListerExpansion allows custom methods to be added to
+// PodProbeMarkerLister.
+type PodProbeMarkerListerExpansion interface{}
+
+// PodProbeMarkerNamespaceListerExpansion allows custom methods to be added to
+// PodProbeMarkerNamespaceLister.
+type PodProbeMarkerNamespaceListerExpansion interface{}
 
 // ResourceDistributionListerExpansion allows custom methods to be added to
 // ResourceDistributionLister.

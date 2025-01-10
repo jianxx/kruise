@@ -5,10 +5,10 @@ import (
 
 	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
 	"github.com/openkruise/kruise/pkg/control/sidecarcontrol"
+	"github.com/openkruise/kruise/pkg/util"
 	"github.com/openkruise/kruise/pkg/util/updatesort"
 
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	intstrutil "k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/klog/v2"
@@ -22,7 +22,8 @@ type Strategy interface {
 	//2. Sort Pods with default sequence
 	//3. sort waitUpdateIndexes based on the scatter rules
 	//4. calculate max count of pods can update with maxUnavailable
-	GetNextUpgradePods(control sidecarcontrol.SidecarControl, pods []*corev1.Pod) []*corev1.Pod
+	//5. also return the pods that are not upgradable
+	GetNextUpgradePods(control sidecarcontrol.SidecarControl, pods []*corev1.Pod) (upgradePods []*corev1.Pod, notUpgradablePods []*corev1.Pod)
 }
 
 type spreadingStrategy struct{}
@@ -35,22 +36,24 @@ func NewStrategy() Strategy {
 	return globalSpreadingStrategy
 }
 
-func (p *spreadingStrategy) GetNextUpgradePods(control sidecarcontrol.SidecarControl, pods []*corev1.Pod) (upgradePods []*corev1.Pod) {
+func (p *spreadingStrategy) GetNextUpgradePods(control sidecarcontrol.SidecarControl, pods []*corev1.Pod) (upgradePods []*corev1.Pod, notUpgradablePods []*corev1.Pod) {
 	sidecarset := control.GetSidecarset()
 	// wait to upgrade pod index
 	var waitUpgradedIndexes []int
+	// because SidecarSet in-place update only support upgrading Image, if other fields are changed they will not be upgraded.
+	var notUpgradableIndexes []int
 	strategy := sidecarset.Spec.UpdateStrategy
 
 	// If selector is not nil, check whether the pods is selected to upgrade
 	isSelected := func(pod *corev1.Pod) bool {
-		//when selector is nil, always return ture
+		//when selector is nil, always return true
 		if strategy.Selector == nil {
 			return true
 		}
 		// if selector failed, always return false
-		selector, err := metav1.LabelSelectorAsSelector(strategy.Selector)
+		selector, err := util.ValidatedLabelSelectorAsSelector(strategy.Selector)
 		if err != nil {
-			klog.Errorf("sidecarSet(%s) rolling selector error, err: %v", sidecarset.Name, err)
+			klog.ErrorS(err, "SidecarSet rolling selector error", "sidecarSet", klog.KObj(sidecarset))
 			return false
 		}
 		//matched
@@ -68,12 +71,19 @@ func (p *spreadingStrategy) GetNextUpgradePods(control sidecarcontrol.SidecarCon
 	//  * It is to determine whether there are other fields that have been modified for pod.
 	for index, pod := range pods {
 		isUpdated := sidecarcontrol.IsPodSidecarUpdated(sidecarset, pod)
-		if !isUpdated && isSelected(pod) && control.IsSidecarSetUpgradable(pod) {
-			waitUpgradedIndexes = append(waitUpgradedIndexes, index)
+		if !isUpdated && isSelected(pod) {
+			canUpgrade, consistent := control.IsSidecarSetUpgradable(pod)
+			if canUpgrade && consistent {
+				waitUpgradedIndexes = append(waitUpgradedIndexes, index)
+			} else if !canUpgrade {
+				// only image field can be in-place updated, if other fields changed, mark pod as not upgradable
+				notUpgradableIndexes = append(notUpgradableIndexes, index)
+			}
 		}
 	}
 
-	klog.V(3).Infof("sidecarSet(%s) matchedPods(%d) waitUpdated(%d)", sidecarset.Name, len(pods), len(waitUpgradedIndexes))
+	klog.V(3).InfoS("SidecarSet's pods status", "sidecarSet", klog.KObj(sidecarset), "matchedPods", len(pods),
+		"waitUpdated", len(waitUpgradedIndexes), "notUpgradable", len(notUpgradableIndexes))
 	//2. sort Pods with default sequence and scatter
 	waitUpgradedIndexes = SortUpdateIndexes(strategy, pods, waitUpgradedIndexes)
 
@@ -86,6 +96,10 @@ func (p *spreadingStrategy) GetNextUpgradePods(control sidecarcontrol.SidecarCon
 	//4. injectPods will be upgraded in the following process
 	for _, idx := range waitUpgradedIndexes {
 		upgradePods = append(upgradePods, pods[idx])
+	}
+	// 5. pods that are not upgradable will not be skipped in the following process
+	for _, idx := range notUpgradableIndexes {
+		notUpgradablePods = append(notUpgradablePods, pods[idx])
 	}
 	return
 }
@@ -100,6 +114,11 @@ func SortUpdateIndexes(strategy appsv1alpha1.SidecarSetUpdateStrategy, pods []*c
 	//	- Pods with containers with higher restart counts < lower restart counts
 	//	- Empty creation time pods < newer pods < older pods
 	sort.Slice(waitUpdateIndexes, sidecarcontrol.GetPodsSortFunc(pods, waitUpdateIndexes))
+
+	//sort waitUpdateIndexes based on the priority rules
+	if strategy.PriorityStrategy != nil {
+		waitUpdateIndexes = updatesort.NewPrioritySorter(strategy.PriorityStrategy).Sort(pods, waitUpdateIndexes)
+	}
 
 	//sort waitUpdateIndexes based on the scatter rules
 	if strategy.ScatterStrategy != nil {
@@ -120,7 +139,8 @@ func calculateUpgradeCount(coreControl sidecarcontrol.SidecarControl, waitUpdate
 	// default partition = 0, indicates all pods will been upgraded
 	var partition int
 	if strategy.Partition != nil {
-		partition, _ = intstrutil.GetValueFromIntOrPercent(strategy.Partition, totalReplicas, false)
+		totalInt32 := int32(totalReplicas)
+		partition, _ = util.CalculatePartitionReplicas(strategy.Partition, &totalInt32)
 	}
 	// indicates the partition pods will not be upgraded for the time
 	if len(waitUpdateIndexes)-partition <= 0 {
@@ -131,7 +151,7 @@ func calculateUpgradeCount(coreControl sidecarcontrol.SidecarControl, waitUpdate
 	// max unavailable pods number, default is 1
 	maxUnavailable := 1
 	if strategy.MaxUnavailable != nil {
-		maxUnavailable, _ = intstrutil.GetValueFromIntOrPercent(strategy.MaxUnavailable, totalReplicas, false)
+		maxUnavailable, _ = intstrutil.GetValueFromIntOrPercent(strategy.MaxUnavailable, totalReplicas, true)
 	}
 
 	var upgradeAndNotReadyCount int

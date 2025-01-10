@@ -35,10 +35,18 @@ type Interface interface {
 	DaemonSets() DaemonSetInformer
 	// EphemeralJobs returns a EphemeralJobInformer.
 	EphemeralJobs() EphemeralJobInformer
+	// ImageListPullJobs returns a ImageListPullJobInformer.
+	ImageListPullJobs() ImageListPullJobInformer
 	// ImagePullJobs returns a ImagePullJobInformer.
 	ImagePullJobs() ImagePullJobInformer
 	// NodeImages returns a NodeImageInformer.
 	NodeImages() NodeImageInformer
+	// NodePodProbes returns a NodePodProbeInformer.
+	NodePodProbes() NodePodProbeInformer
+	// PersistentPodStates returns a PersistentPodStateInformer.
+	PersistentPodStates() PersistentPodStateInformer
+	// PodProbeMarkers returns a PodProbeMarkerInformer.
+	PodProbeMarkers() PodProbeMarkerInformer
 	// ResourceDistributions returns a ResourceDistributionInformer.
 	ResourceDistributions() ResourceDistributionInformer
 	// SidecarSets returns a SidecarSetInformer.
@@ -92,6 +100,11 @@ func (v *version) EphemeralJobs() EphemeralJobInformer {
 	return &ephemeralJobInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }
 
+// ImageListPullJobs returns a ImageListPullJobInformer.
+func (v *version) ImageListPullJobs() ImageListPullJobInformer {
+	return &imageListPullJobInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
 // ImagePullJobs returns a ImagePullJobInformer.
 func (v *version) ImagePullJobs() ImagePullJobInformer {
 	return &imagePullJobInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
@@ -100,6 +113,21 @@ func (v *version) ImagePullJobs() ImagePullJobInformer {
 // NodeImages returns a NodeImageInformer.
 func (v *version) NodeImages() NodeImageInformer {
 	return &nodeImageInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
+}
+
+// NodePodProbes returns a NodePodProbeInformer.
+func (v *version) NodePodProbes() NodePodProbeInformer {
+	return &nodePodProbeInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
+}
+
+// PersistentPodStates returns a PersistentPodStateInformer.
+func (v *version) PersistentPodStates() PersistentPodStateInformer {
+	return &persistentPodStateInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
+// PodProbeMarkers returns a PodProbeMarkerInformer.
+func (v *version) PodProbeMarkers() PodProbeMarkerInformer {
+	return &podProbeMarkerInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }
 
 // ResourceDistributions returns a ResourceDistributionInformer.

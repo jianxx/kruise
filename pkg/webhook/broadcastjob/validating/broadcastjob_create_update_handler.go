@@ -22,15 +22,17 @@ import (
 	"net/http"
 	"regexp"
 
-	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
-	"github.com/openkruise/kruise/pkg/controller/broadcastjob"
-	"github.com/openkruise/kruise/pkg/webhook/util/convertor"
 	v1 "k8s.io/api/core/v1"
 	genericvalidation "k8s.io/apimachinery/pkg/api/validation"
 	validationutil "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	corevalidation "k8s.io/kubernetes/pkg/apis/core/validation"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+
+	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
+	"github.com/openkruise/kruise/pkg/controller/broadcastjob"
+	webhookutil "github.com/openkruise/kruise/pkg/webhook/util"
+	"github.com/openkruise/kruise/pkg/webhook/util/convertor"
 )
 
 const (
@@ -107,7 +109,7 @@ func validateBroadcastJobSpec(spec *appsv1alpha1.BroadcastJobSpec, fldPath *fiel
 				fmt.Sprintf("\"%s\" and \"%s\" are not allowed to preset in pod labels", broadcastjob.JobNameLabelKey, broadcastjob.ControllerUIDLabelKey)))
 		}
 	}
-	return append(allErrs, corevalidation.ValidatePodTemplateSpec(coreTemplate, fldPath.Child("template"), corevalidation.PodValidationOptions{AllowDownwardAPIHugePages: true, AllowMultipleHugePageResources: true})...)
+	return append(allErrs, corevalidation.ValidatePodTemplateSpec(coreTemplate, fldPath.Child("template"), webhookutil.DefaultPodValidationOptions)...)
 }
 
 func validateBroadcastJobName(name string, prefix bool) (allErrs []string) {
@@ -145,11 +147,3 @@ func (h *BroadcastJobCreateUpdateHandler) Handle(ctx context.Context, req admiss
 //	h.Client = c
 //	return nil
 //}
-
-var _ admission.DecoderInjector = &BroadcastJobCreateUpdateHandler{}
-
-// InjectDecoder injects the decoder into the BroadcastJobCreateUpdateHandler
-func (h *BroadcastJobCreateUpdateHandler) InjectDecoder(d *admission.Decoder) error {
-	h.Decoder = d
-	return nil
-}

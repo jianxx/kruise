@@ -22,14 +22,30 @@ import (
 )
 
 const (
-	ImagePreDownloadParallelismKey    = "apps.kruise.io/image-predownload-parallelism"
-	ImagePreDownloadTimeoutSecondsKey = "apps.kruise.io/image-predownload-timeout-seconds"
+	ImagePreDownloadParallelismKey      = "apps.kruise.io/image-predownload-parallelism"
+	ImagePreDownloadTimeoutSecondsKey   = "apps.kruise.io/image-predownload-timeout-seconds"
+	ImagePreDownloadMinUpdatedReadyPods = "apps.kruise.io/image-predownload-min-updated-ready-pods"
+)
+
+// ImagePullPolicy describes a policy for if/when to pull a container image
+// +enum
+type ImagePullPolicy string
+
+const (
+	// PullAlways means that kruise-daemon always attempts to pull the latest image.
+	PullAlways ImagePullPolicy = "Always"
+	// PullIfNotPresent means that kruise-daemon pulls if the image isn't present on disk.
+	PullIfNotPresent ImagePullPolicy = "IfNotPresent"
 )
 
 // ImagePullJobSpec defines the desired state of ImagePullJob
 type ImagePullJobSpec struct {
 	// Image is the image to be pulled by the job
-	Image string `json:"image"`
+	Image                string `json:"image"`
+	ImagePullJobTemplate `json:",inline"`
+}
+
+type ImagePullJobTemplate struct {
 
 	// ImagePullSecrets is an optional list of references to secrets in the same namespace to use for pulling the image.
 	// If specified, these secrets will be passed to individual puller implementations for them to use.  For example,
@@ -60,6 +76,15 @@ type ImagePullJobSpec struct {
 	// CompletionPolicy indicates the completion policy of the job.
 	// Default is Always CompletionPolicyType.
 	CompletionPolicy CompletionPolicy `json:"completionPolicy"`
+
+	// SandboxConfig support attach metadata in PullImage CRI interface during ImagePulljobs
+	// +optional
+	SandboxConfig *SandboxConfig `json:"sandboxConfig,omitempty"`
+
+	// Image pull policy.
+	// One of Always, IfNotPresent. Defaults to IfNotPresent.
+	// +optional
+	ImagePullPolicy ImagePullPolicy `json:"imagePullPolicy,omitempty"`
 }
 
 // ImagePullJobPodSelector is a selector over pods

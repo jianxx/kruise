@@ -17,7 +17,7 @@ limitations under the License.
 package v1alpha1
 
 import (
-	batchv1beta1 "k8s.io/api/batch/v1beta1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -31,7 +31,10 @@ type AdvancedCronJobSpec struct {
 	// The schedule in Cron format, see https://en.wikipedia.org/wiki/Cron.
 	Schedule string `json:"schedule" protobuf:"bytes,1,opt,name=schedule"`
 
-	// +kubebuilder:validation:Minimum=0
+	// The time zone name for the given schedule, see https://en.wikipedia.org/wiki/List_of_tz_database_time_zones.
+	// If not specified, this will default to the time zone of the kruise-controller-manager process.
+	// +optional
+	TimeZone *string `json:"timeZone,omitempty" protobuf:"bytes,8,opt,name=timeZone"`
 
 	// Optional deadline in seconds for starting the job if it misses scheduled
 	// time for any reason.  Missed jobs executions will be counted as failed ones.
@@ -50,14 +53,10 @@ type AdvancedCronJobSpec struct {
 	// +optional
 	Paused *bool `json:"paused,omitempty" protobuf:"bytes,4,opt,name=paused"`
 
-	// +kubebuilder:validation:Minimum=0
-
 	// The number of successful finished jobs to retain.
 	// This is a pointer to distinguish between explicit zero and not specified.
 	// +optional
 	SuccessfulJobsHistoryLimit *int32 `json:"successfulJobsHistoryLimit,omitempty" protobuf:"varint,5,opt,name=successfulJobsHistoryLimit"`
-
-	// +kubebuilder:validation:Minimum=0
 
 	// The number of failed finished jobs to retain.
 	// This is a pointer to distinguish between explicit zero and not specified.
@@ -73,7 +72,7 @@ type CronJobTemplate struct {
 	// +optional
 	// +kubebuilder:pruning:PreserveUnknownFields
 	// +kubebuilder:validation:Schemaless
-	JobTemplate *batchv1beta1.JobTemplateSpec `json:"jobTemplate,omitempty" protobuf:"bytes,1,opt,name=jobTemplate"`
+	JobTemplate *batchv1.JobTemplateSpec `json:"jobTemplate,omitempty" protobuf:"bytes,1,opt,name=jobTemplate"`
 
 	// Specifies the broadcastjob that will be created when executing a BroadcastCronJob.
 	// +optional

@@ -19,8 +19,11 @@ package util
 import (
 	"os"
 	"strconv"
+	"time"
 
 	"k8s.io/klog/v2"
+
+	"github.com/openkruise/kruise/pkg/util"
 )
 
 func GetHost() string {
@@ -28,10 +31,7 @@ func GetHost() string {
 }
 
 func GetNamespace() string {
-	if ns := os.Getenv("POD_NAMESPACE"); len(ns) > 0 {
-		return ns
-	}
-	return "kruise-system"
+	return util.GetKruiseNamespace()
 }
 
 func GetSecretName() string {
@@ -69,4 +69,37 @@ func GetCertDir() string {
 
 func GetCertWriter() string {
 	return os.Getenv("WEBHOOK_CERT_WRITER")
+}
+
+var (
+	renewBefore time.Duration
+)
+
+func GetRenewBeforeTime() time.Duration {
+	if renewBefore != 0 {
+		return renewBefore
+	}
+	renewBefore = 6 * 30 * 24 * time.Hour
+	if s := os.Getenv("CERTS_RENEW_BEFORE"); len(s) > 0 {
+		t, err := strconv.Atoi(s[0 : len(s)-1])
+		if err != nil {
+			klog.ErrorS(err, "failed to parse time", "time", s[0:len(s)-1])
+			return renewBefore
+		}
+		suffix := s[len(s)-1]
+		if suffix == 'd' {
+			renewBefore = time.Duration(t) * 7 * time.Hour
+		} else if suffix == 'm' {
+			renewBefore = time.Duration(t) * 30 * time.Hour
+		} else if suffix == 'y' {
+			renewBefore = time.Duration(t) * 365 * time.Hour
+		} else {
+			klog.InfoS("unknown date suffix", "suffix", suffix)
+		}
+	}
+	if renewBefore <= 0 {
+		klog.Error("renewBefore time can not be less or equal than 0")
+		renewBefore = 6 * 30 * 24 * time.Hour
+	}
+	return renewBefore
 }

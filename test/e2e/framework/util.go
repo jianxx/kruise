@@ -34,24 +34,27 @@ import (
 	"github.com/onsi/ginkgo"
 	"github.com/onsi/gomega"
 	v1 "k8s.io/api/core/v1"
-	apierrs "k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	clientset "k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	watchtools "k8s.io/client-go/tools/watch"
+	v1helper "k8s.io/component-helpers/scheduling/corev1"
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
-	v1helper "k8s.io/kubernetes/pkg/apis/core/v1/helper"
 	"k8s.io/kubernetes/pkg/client/conditions"
-	"k8s.io/kubernetes/test/e2e/framework/ginkgowrapper"
 	uexec "k8s.io/utils/exec"
 )
 
@@ -146,7 +149,7 @@ const (
 	RestartPodReadyAgainTimeout = 5 * time.Minute
 
 	// Number of objects that gc can delete in a second.
-	// GC issues 2 requestes for single delete.
+	// GC issues 2 requests for single delete.
 	gcThroughput = 10
 
 	// Minimal number of nodes for the cluster to be considered large.
@@ -227,13 +230,28 @@ func WaitForDefaultServiceAccountInNamespace(c clientset.Interface, namespace st
 }
 
 func waitForServiceAccountInNamespace(c clientset.Interface, ns, serviceAccountName string, timeout time.Duration) error {
-	w, err := c.CoreV1().ServiceAccounts(ns).Watch(context.TODO(), metav1.SingleObject(metav1.ObjectMeta{Name: serviceAccountName}))
-	if err != nil {
-		return err
+	fieldSelector := fields.OneTermEqualSelector("metadata.name", serviceAccountName).String()
+	lw := &cache.ListWatch{
+		ListFunc: func(options metav1.ListOptions) (object runtime.Object, e error) {
+			options.FieldSelector = fieldSelector
+			return c.CoreV1().ServiceAccounts(ns).List(context.TODO(), options)
+		},
+		WatchFunc: func(options metav1.ListOptions) (i watch.Interface, e error) {
+			options.FieldSelector = fieldSelector
+			return c.CoreV1().ServiceAccounts(ns).Watch(context.TODO(), options)
+		},
 	}
 	ctx, cancel := watchtools.ContextWithOptionalTimeout(context.Background(), timeout)
 	defer cancel()
-	_, err = watchtools.UntilWithoutRetry(ctx, w, conditions.ServiceAccountHasSecrets)
+	_, err := watchtools.UntilWithSync(ctx, lw, &v1.ServiceAccount{}, nil, func(event watch.Event) (bool, error) {
+		switch event.Type {
+		case watch.Deleted:
+			return false, apierrors.NewNotFound(schema.GroupResource{Resource: "serviceaccounts"}, serviceAccountName)
+		case watch.Added, watch.Modified:
+			return true, nil
+		}
+		return false, nil
+	})
 	return err
 }
 
@@ -248,7 +266,7 @@ func deleteNS(c clientset.Interface, dynamicClient dynamic.Interface, namespace 
 	// wait for namespace to delete or timeout.
 	err := wait.PollImmediate(2*time.Second, timeout, func() (bool, error) {
 		if _, err := c.CoreV1().Namespaces().Get(context.TODO(), namespace, metav1.GetOptions{}); err != nil {
-			if apierrs.IsNotFound(err) {
+			if apierrors.IsNotFound(err) {
 				return true, nil
 			}
 			Logf("Error while waiting for namespace to be terminated: %v", err)
@@ -350,14 +368,14 @@ func logNamespaces(c clientset.Interface, namespace string) {
 func logNamespace(c clientset.Interface, namespace string) {
 	ns, err := c.CoreV1().Namespaces().Get(context.TODO(), namespace, metav1.GetOptions{})
 	if err != nil {
-		if apierrs.IsNotFound(err) {
+		if apierrors.IsNotFound(err) {
 			Logf("namespace: %v no longer exists", namespace)
 			return
 		}
 		Logf("namespace: %v, unable to get namespace due to error: %v", namespace, err)
 		return
 	}
-	Logf("namespace: %v, DeletionTimetamp: %v, Finalizers: %v, Phase: %v", ns.Name, ns.DeletionTimestamp, ns.Spec.Finalizers, ns.Status.Phase)
+	Logf("namespace: %v, DeletionTimestamp: %v, Finalizers: %v, Phase: %v", ns.Name, ns.DeletionTimestamp, ns.Spec.Finalizers, ns.Status.Phase)
 }
 
 // hasRemainingContent checks if there is remaining content in the namespace via API discovery
@@ -403,11 +421,11 @@ func hasRemainingContent(c clientset.Interface, dynamicClient dynamic.Interface,
 		unstructuredList, err := dynamicClient.List(context.TODO(), metav1.ListOptions{})
 		if err != nil {
 			// not all resources support list, so we ignore those
-			if apierrs.IsMethodNotSupported(err) || apierrs.IsNotFound(err) || apierrs.IsForbidden(err) {
+			if apierrors.IsMethodNotSupported(err) || apierrors.IsNotFound(err) || apierrors.IsForbidden(err) {
 				continue
 			}
 			// skip unavailable servers
-			if apierrs.IsServiceUnavailable(err) {
+			if apierrors.IsServiceUnavailable(err) {
 				continue
 			}
 			return false, err
@@ -658,7 +676,7 @@ func Failf(format string, args ...interface{}) {
 func FailfWithOffset(offset int, format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
 	log("INFO", msg)
-	ginkgowrapper.Fail(nowStamp()+": "+msg, 1+offset)
+	ginkgo.Fail(nowStamp()+": "+msg, 1+offset)
 }
 
 // ExpectNoError checks if "err" is set
@@ -1136,7 +1154,7 @@ func WaitForPodCondition(c clientset.Interface, ns, podName, desc string, timeou
 	for start := time.Now(); time.Since(start) < timeout; time.Sleep(Poll) {
 		pod, err := c.CoreV1().Pods(ns).Get(context.TODO(), podName, metav1.GetOptions{})
 		if err != nil {
-			if apierrs.IsNotFound(err) {
+			if apierrors.IsNotFound(err) {
 				Logf("Pod %q in namespace %q not found. Error: %v", podName, ns, err)
 				return err
 			}

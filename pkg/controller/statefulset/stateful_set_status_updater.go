@@ -21,12 +21,13 @@ import (
 	"context"
 	"fmt"
 
-	appsv1beta1 "github.com/openkruise/kruise/apis/apps/v1beta1"
-	clientset "github.com/openkruise/kruise/pkg/client/clientset/versioned"
-	appslisters "github.com/openkruise/kruise/pkg/client/listers/apps/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/util/retry"
+
+	appsv1beta1 "github.com/openkruise/kruise/apis/apps/v1beta1"
+	clientset "github.com/openkruise/kruise/pkg/client/clientset/versioned"
+	appslisters "github.com/openkruise/kruise/pkg/client/listers/apps/v1beta1"
 )
 
 // StatusUpdaterInterface is an interface used to update the StatefulSetStatus associated with a StatefulSet.
@@ -34,7 +35,7 @@ import (
 type StatusUpdaterInterface interface {
 	// UpdateStatefulSetStatus sets the set's Status to status. Implementations are required to retry on conflicts,
 	// but fail on other errors. If the returned error is nil set's Status has been successfully set to status.
-	UpdateStatefulSetStatus(set *appsv1beta1.StatefulSet, status *appsv1beta1.StatefulSetStatus) error
+	UpdateStatefulSetStatus(ctx context.Context, set *appsv1beta1.StatefulSet, status *appsv1beta1.StatefulSetStatus) error
 }
 
 // NewRealStatefulSetStatusUpdater returns a StatusUpdaterInterface that updates the Status of a StatefulSet,
@@ -51,6 +52,7 @@ type realStatefulSetStatusUpdater struct {
 }
 
 func (ssu *realStatefulSetStatusUpdater) UpdateStatefulSetStatus(
+	ctx context.Context,
 	set *appsv1beta1.StatefulSet,
 	status *appsv1beta1.StatefulSetStatus) error {
 	// don't wait due to limited number of clients, but backoff after the default number of steps

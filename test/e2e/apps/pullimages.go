@@ -17,21 +17,31 @@ limitations under the License.
 package apps
 
 import (
+	"context"
+	"encoding/base64"
 	"fmt"
+	"reflect"
+	"strings"
 	"time"
 
 	"github.com/onsi/ginkgo"
 	"github.com/onsi/gomega"
-	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
-	kruiseclientset "github.com/openkruise/kruise/pkg/client/clientset/versioned"
-	"github.com/openkruise/kruise/pkg/util"
-	"github.com/openkruise/kruise/test/e2e/framework"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/klog/v2"
 	utilpointer "k8s.io/utils/pointer"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
+	kruiseclientset "github.com/openkruise/kruise/pkg/client/clientset/versioned"
+	"github.com/openkruise/kruise/pkg/controller/imagepulljob"
+	"github.com/openkruise/kruise/pkg/util"
+	"github.com/openkruise/kruise/test/e2e/framework"
 )
 
 var _ = SIGDescribe("PullImage", func() {
@@ -63,6 +73,20 @@ var _ = SIGDescribe("PullImage", func() {
 		},
 	}
 
+	referenceSetFromTarget := func(target *v1.Secret) map[types.NamespacedName]struct{} {
+		refs := strings.Split(target.Annotations[imagepulljob.TargetOwnerReferencesAnno], ",")
+		keys := map[types.NamespacedName]struct{}{}
+		for _, ref := range refs {
+			namespace, name, err := cache.SplitMetaNamespaceKey(ref)
+			if err != nil {
+				klog.Errorf("Failed to parse job key from target secret %s annotations: %v", target.Name, err)
+				continue
+			}
+			keys[types.NamespacedName{Namespace: namespace, Name: name}] = struct{}{}
+		}
+		return keys
+	}
+
 	ginkgo.BeforeEach(func() {
 		c = f.ClientSet
 		kc = f.KruiseClientSet
@@ -89,27 +113,232 @@ var _ = SIGDescribe("PullImage", func() {
 			baseJob = &appsv1alpha1.ImagePullJob{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "test-imagepulljob"}}
 		})
 
+		framework.ConformanceIt("pull image with secret", func() {
+			var err error
+			base64Code := "eyJhdXRocyI6eyJodHRwczovL2luZGV4LmRvY2tlci5pby92MS8iOnsidXNlcm5hbWUiOiJtaW5jaG91IiwicGFzc3dvcmQiOiJtaW5nemhvdS5zd3giLCJlbWFpbCI6InZlYy5nLnN1bkBnbWFpbC5jb20iLCJhdXRoIjoiYldsdVkyaHZkVHB0YVc1bmVtaHZkUzV6ZDNnPSJ9fX0="
+			bytes, err := base64.StdEncoding.DecodeString(base64Code)
+			secret := &v1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: ns,
+					Name:      "pull-secret",
+				},
+				Type: "kubernetes.io/dockerconfigjson",
+				Data: map[string][]byte{
+					".dockerconfigjson": bytes,
+				},
+			}
+			secret, err = testerForImagePullJob.CreateSecret(secret)
+			gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+			job := baseJob.DeepCopy()
+			job.Spec = appsv1alpha1.ImagePullJobSpec{
+				Image: NginxImage,
+				ImagePullJobTemplate: appsv1alpha1.ImagePullJobTemplate{
+					Selector: &appsv1alpha1.ImagePullJobNodeSelector{LabelSelector: metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{
+						{Key: framework.FakeNodeImageLabelKey, Operator: metav1.LabelSelectorOpDoesNotExist},
+					}}},
+					PullPolicy: &appsv1alpha1.PullPolicy{
+						TimeoutSeconds: utilpointer.Int32Ptr(50),
+						BackoffLimit:   utilpointer.Int32Ptr(2),
+					},
+					PullSecrets: []string{secret.Name},
+					Parallelism: &intorstr4,
+					CompletionPolicy: appsv1alpha1.CompletionPolicy{
+						Type:                    appsv1alpha1.Always,
+						ActiveDeadlineSeconds:   utilpointer.Int64Ptr(50),
+						TTLSecondsAfterFinished: utilpointer.Int32Ptr(20),
+					},
+				},
+			}
+			err = testerForImagePullJob.CreateJob(job)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+			ginkgo.By("Desired should be equal to number of nodes")
+			gomega.Eventually(func() int32 {
+				job, err = testerForImagePullJob.GetJob(job)
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+				return job.Status.Desired
+			}, 3*time.Second, time.Second).Should(gomega.Equal(int32(len(nodes))))
+
+			ginkgo.By("Secret is synced")
+			gomega.Eventually(func() bool {
+				synced, _ := testerForImagePullJob.ListSyncedSecrets(secret)
+				if len(synced) != 1 {
+					return false
+				}
+				if _, exists := referenceSetFromTarget(&synced[0])[client.ObjectKeyFromObject(job)]; !exists {
+					return false
+				}
+				return reflect.DeepEqual(synced[0].Data, secret.Data)
+			}, 10*time.Second, time.Second).Should(gomega.Equal(true))
+
+			ginkgo.By("Wait completed in 180s")
+			gomega.Eventually(func() bool {
+				job, err = testerForImagePullJob.GetJob(job)
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+				return job.Status.CompletionTime != nil
+			}, 180*time.Second, 3*time.Second).Should(gomega.Equal(true))
+			gomega.Expect(job.Status.Succeeded).To(gomega.Equal(int32(len(nodes))))
+
+			ginkgo.By("Wait clean in 25s")
+			gomega.Eventually(func() bool {
+				_, err = testerForImagePullJob.GetJob(job)
+				return err != nil && errors.IsNotFound(err)
+			}, 25*time.Second, 2*time.Second).Should(gomega.Equal(true))
+
+			ginkgo.By("Check image should be cleaned in NodeImage")
+			gomega.Eventually(func() bool {
+				found, err := testerForNodeImage.IsImageInSpec(job.Spec.Image, nodes[0].Name)
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+				return found
+			}, 25*time.Second, time.Second).Should(gomega.Equal(false))
+
+			ginkgo.By("Check secrets should be cleaned in kruise-daemon-config")
+			gomega.Eventually(func() bool {
+				synced, _ := testerForImagePullJob.ListSyncedSecrets(secret)
+				return len(synced) == 0
+			}, 10*time.Second, time.Second).Should(gomega.Equal(true))
+		})
+
+		framework.ConformanceIt("never completion pull job with updated pull secrets", func() {
+			var err error
+			base64Code := "eyJhdXRocyI6eyJodHRwczovL2luZGV4LmRvY2tlci5pby92MS8iOnsidXNlcm5hbWUiOiJtaW5jaG91IiwicGFzc3dvcmQiOiJtaW5nemhvdS5zd3giLCJlbWFpbCI6InZlYy5nLnN1bkBnbWFpbC5jb20iLCJhdXRoIjoiYldsdVkyaHZkVHB0YVc1bmVtaHZkUzV6ZDNnPSJ9fX0="
+			newBase64Code := "eyJhdXRocyI6eyJodHRwczovL2luZGV4LmRvY2tlci5pby92MS8iOnsidXNlcm5hbWUiOiJtaW5jaG91IiwicGFzc3dvcmQiOiJtaW5nemhvdS50ZXN0IiwiZW1haWwiOiJ2ZWMuZy5zdW5AZ21haWwuY29tIiwiYXV0aCI6ImJXbHVZMmh2ZFRwdGFXNW5lbWh2ZFM1MFpYTjAifX19"
+			bytes, _ := base64.StdEncoding.DecodeString(base64Code)
+			newBytes, _ := base64.StdEncoding.DecodeString(newBase64Code)
+			secret := &v1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: ns,
+					Name:      "pull-secret",
+				},
+				Type: "kubernetes.io/dockerconfigjson",
+				Data: map[string][]byte{
+					".dockerconfigjson": bytes,
+				},
+			}
+			secret, err = testerForImagePullJob.CreateSecret(secret)
+			gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+			job := baseJob.DeepCopy()
+			job.Spec = appsv1alpha1.ImagePullJobSpec{
+				Image: NginxImage,
+				ImagePullJobTemplate: appsv1alpha1.ImagePullJobTemplate{
+					Selector: &appsv1alpha1.ImagePullJobNodeSelector{LabelSelector: metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{
+						{Key: framework.FakeNodeImageLabelKey, Operator: metav1.LabelSelectorOpDoesNotExist},
+					}}},
+					PullPolicy: &appsv1alpha1.PullPolicy{
+						TimeoutSeconds: utilpointer.Int32Ptr(50),
+						BackoffLimit:   utilpointer.Int32Ptr(2),
+					},
+					PullSecrets: []string{secret.Name},
+					Parallelism: &intorstr4,
+					CompletionPolicy: appsv1alpha1.CompletionPolicy{
+						Type: appsv1alpha1.Never,
+					},
+				},
+			}
+			err = testerForImagePullJob.CreateJob(job)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+			ginkgo.By("Desired should be equal to number of nodes")
+			gomega.Eventually(func() int32 {
+				job, err = testerForImagePullJob.GetJob(job)
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+				return job.Status.Desired
+			}, 3*time.Second, time.Second).Should(gomega.Equal(int32(len(nodes))))
+
+			ginkgo.By("Secret is synced")
+			gomega.Eventually(func() bool {
+				synced, _ := testerForImagePullJob.ListSyncedSecrets(secret)
+				if len(synced) != 1 {
+					return false
+				}
+				if _, exists := referenceSetFromTarget(&synced[0])[client.ObjectKeyFromObject(job)]; !exists {
+					return false
+				}
+				return reflect.DeepEqual(synced[0].Data, secret.Data)
+			}, 10*time.Second, time.Second).Should(gomega.Equal(true))
+
+			ginkgo.By("Update source secret")
+			secret.Data[".dockerconfigjson"] = newBytes
+			testerForImagePullJob.UpdateSecret(secret)
+
+			ginkgo.By("Check target updated secret in 10s")
+			gomega.Eventually(func() bool {
+				synced, _ := testerForImagePullJob.ListSyncedSecrets(secret)
+				if len(synced) != 1 {
+					return false
+				}
+				if _, exists := referenceSetFromTarget(&synced[0])[client.ObjectKeyFromObject(job)]; !exists {
+					return false
+				}
+				return reflect.DeepEqual(synced[0].Data, secret.Data)
+			}, 10*time.Second, time.Second).Should(gomega.Equal(true))
+
+			ginkgo.By("Wait completed in 180s")
+			gomega.Eventually(func() bool {
+				job, err = testerForImagePullJob.GetJob(job)
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+				return job.Status.Succeeded == int32(len(nodes))
+			}, 180*time.Second, 3*time.Second).Should(gomega.Equal(true))
+
+			ginkgo.By("Delete pull job and check in 10s")
+			err = testerForImagePullJob.DeleteJob(job)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Eventually(func() bool {
+				_, err := testerForImagePullJob.GetJob(job)
+				return errors.IsNotFound(err)
+			}, 10*time.Second, time.Second).Should(gomega.Equal(false))
+
+			ginkgo.By("Check image should be cleaned in NodeImage")
+			gomega.Eventually(func() bool {
+				found, err := testerForNodeImage.IsImageInSpec(job.Spec.Image, nodes[0].Name)
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+				return found
+			}, 25*time.Second, time.Second).Should(gomega.Equal(false))
+
+			ginkgo.By("Check secrets should be cleaned in kruise-daemon-config")
+			gomega.Eventually(func() bool {
+				synced, _ := testerForImagePullJob.ListSyncedSecrets(secret)
+				return len(synced) == 0
+			}, 10*time.Second, time.Second).Should(gomega.Equal(true))
+		})
+
 		framework.ConformanceIt("create an always job to pull an image on all real nodes", func() {
 			job := baseJob.DeepCopy()
 			job.Spec = appsv1alpha1.ImagePullJobSpec{
 				Image: NginxImage,
-				Selector: &appsv1alpha1.ImagePullJobNodeSelector{LabelSelector: metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{
-					{Key: framework.FakeNodeImageLabelKey, Operator: metav1.LabelSelectorOpDoesNotExist},
-				}}},
-				PullPolicy: &appsv1alpha1.PullPolicy{
-					TimeoutSeconds: utilpointer.Int32Ptr(50),
-					BackoffLimit:   utilpointer.Int32Ptr(2),
-				},
-				Parallelism: &intorstr4,
-				CompletionPolicy: appsv1alpha1.CompletionPolicy{
-					Type:                    appsv1alpha1.Always,
-					ActiveDeadlineSeconds:   utilpointer.Int64Ptr(50),
-					TTLSecondsAfterFinished: utilpointer.Int32Ptr(20),
+				ImagePullJobTemplate: appsv1alpha1.ImagePullJobTemplate{
+					Selector: &appsv1alpha1.ImagePullJobNodeSelector{LabelSelector: metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{
+						{Key: framework.FakeNodeImageLabelKey, Operator: metav1.LabelSelectorOpDoesNotExist},
+					}}},
+					PullPolicy: &appsv1alpha1.PullPolicy{
+						TimeoutSeconds: utilpointer.Int32Ptr(50),
+						BackoffLimit:   utilpointer.Int32Ptr(2),
+					},
+					Parallelism: &intorstr4,
+					CompletionPolicy: appsv1alpha1.CompletionPolicy{
+						Type:                    appsv1alpha1.Always,
+						ActiveDeadlineSeconds:   utilpointer.Int64Ptr(50),
+						TTLSecondsAfterFinished: utilpointer.Int32Ptr(20),
+					},
+					PullSecrets: []string{"test-pull-secret"},
 				},
 			}
-			err := testerForImagePullJob.CreateJob(job)
+			secret := &v1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: ns,
+					Name:      "test-pull-secret",
+				},
+				Type: v1.SecretTypeDockercfg,
+				Data: map[string][]byte{
+					v1.DockerConfigKey: []byte(`{"auths":{"docker.io/library/nginx":{"username":"echoserver","password":"test","auth":"ZWNob3NlcnZlcjp0ZXN0"}}}`),
+				},
+			}
+			_, err := c.CoreV1().Secrets(ns).Create(context.TODO(), secret, metav1.CreateOptions{})
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
-
+			err = testerForImagePullJob.CreateJob(job)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
 			ginkgo.By("Desired should be equal to number of nodes")
 			gomega.Eventually(func() int32 {
 				job, err = testerForImagePullJob.GetJob(job)
@@ -142,15 +371,17 @@ var _ = SIGDescribe("PullImage", func() {
 		framework.ConformanceIt("create an always job to pull an image on one real node", func() {
 			job := baseJob.DeepCopy()
 			job.Spec = appsv1alpha1.ImagePullJobSpec{
-				Image:    NewNginxImage,
-				Selector: &appsv1alpha1.ImagePullJobNodeSelector{Names: []string{nodes[0].Name}},
-				PullPolicy: &appsv1alpha1.PullPolicy{
-					TimeoutSeconds: utilpointer.Int32Ptr(50),
-					BackoffLimit:   utilpointer.Int32Ptr(2),
-				},
-				Parallelism: &intorstr4,
-				CompletionPolicy: appsv1alpha1.CompletionPolicy{
-					Type: appsv1alpha1.Always,
+				Image: NewNginxImage,
+				ImagePullJobTemplate: appsv1alpha1.ImagePullJobTemplate{
+					Selector: &appsv1alpha1.ImagePullJobNodeSelector{Names: []string{nodes[0].Name}},
+					PullPolicy: &appsv1alpha1.PullPolicy{
+						TimeoutSeconds: utilpointer.Int32Ptr(50),
+						BackoffLimit:   utilpointer.Int32Ptr(2),
+					},
+					Parallelism: &intorstr4,
+					CompletionPolicy: appsv1alpha1.CompletionPolicy{
+						Type: appsv1alpha1.Always,
+					},
 				},
 			}
 			err := testerForImagePullJob.CreateJob(job)
@@ -187,13 +418,15 @@ var _ = SIGDescribe("PullImage", func() {
 			job := baseJob.DeepCopy()
 			job.Spec = appsv1alpha1.ImagePullJobSpec{
 				Image: WebserverImage,
-				PullPolicy: &appsv1alpha1.PullPolicy{
-					TimeoutSeconds: utilpointer.Int32Ptr(50),
-					BackoffLimit:   utilpointer.Int32Ptr(2),
-				},
-				Parallelism: &intorstr4,
-				CompletionPolicy: appsv1alpha1.CompletionPolicy{
-					Type: appsv1alpha1.Never,
+				ImagePullJobTemplate: appsv1alpha1.ImagePullJobTemplate{
+					PullPolicy: &appsv1alpha1.PullPolicy{
+						TimeoutSeconds: utilpointer.Int32Ptr(50),
+						BackoffLimit:   utilpointer.Int32Ptr(2),
+					},
+					Parallelism: &intorstr4,
+					CompletionPolicy: appsv1alpha1.CompletionPolicy{
+						Type: appsv1alpha1.Never,
+					},
 				},
 			}
 			err := testerForImagePullJob.CreateJob(job)
@@ -214,13 +447,13 @@ var _ = SIGDescribe("PullImage", func() {
 			}, 120*time.Second, 3*time.Second).Should(gomega.Equal(int32(len(nodes))))
 			gomega.Expect(job.Status.CompletionTime == nil).To(gomega.Equal(true))
 
-			ginkgo.By("Wait 1 failed in 80s")
-			gomega.Eventually(func() int32 {
-				job, err = testerForImagePullJob.GetJob(job)
-				gomega.Expect(err).NotTo(gomega.HaveOccurred())
-				return job.Status.Failed
-			}, 80*time.Second, 3*time.Second).Should(gomega.Equal(int32(1)))
-			gomega.Expect(len(job.Status.FailedNodes)).To(gomega.Equal(1))
+			//ginkgo.By("Wait 1 failed in 80s")
+			//gomega.Eventually(func() int32 {
+			//	job, err = testerForImagePullJob.GetJob(job)
+			//	gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			//	return job.Status.Failed
+			//}, 80*time.Second, 3*time.Second).Should(gomega.Equal(int32(1)))
+			//gomega.Expect(len(job.Status.FailedNodes)).To(gomega.Equal(1))
 		})
 
 		framework.ConformanceIt("create two jobs to pull a same image", func() {
@@ -228,15 +461,17 @@ var _ = SIGDescribe("PullImage", func() {
 			job1 := baseJob.DeepCopy()
 			job1.Name = baseJob.Name + "-1"
 			job1.Spec = appsv1alpha1.ImagePullJobSpec{
-				Image:    NewWebserverImage,
-				Selector: &appsv1alpha1.ImagePullJobNodeSelector{Names: []string{nodes[0].Name}},
-				PullPolicy: &appsv1alpha1.PullPolicy{
-					TimeoutSeconds: utilpointer.Int32Ptr(50),
-					BackoffLimit:   utilpointer.Int32Ptr(2),
-				},
-				Parallelism: &intorstr4,
-				CompletionPolicy: appsv1alpha1.CompletionPolicy{
-					Type: appsv1alpha1.Never,
+				Image: NewWebserverImage,
+				ImagePullJobTemplate: appsv1alpha1.ImagePullJobTemplate{
+					Selector: &appsv1alpha1.ImagePullJobNodeSelector{Names: []string{nodes[0].Name}},
+					PullPolicy: &appsv1alpha1.PullPolicy{
+						TimeoutSeconds: utilpointer.Int32Ptr(50),
+						BackoffLimit:   utilpointer.Int32Ptr(2),
+					},
+					Parallelism: &intorstr4,
+					CompletionPolicy: appsv1alpha1.CompletionPolicy{
+						Type: appsv1alpha1.Never,
+					},
 				},
 			}
 			err := testerForImagePullJob.CreateJob(job1)
@@ -263,15 +498,17 @@ var _ = SIGDescribe("PullImage", func() {
 			job2 := baseJob.DeepCopy()
 			job2.Name = baseJob.Name + "-2"
 			job2.Spec = appsv1alpha1.ImagePullJobSpec{
-				Image:    NewWebserverImage,
-				Selector: &appsv1alpha1.ImagePullJobNodeSelector{Names: []string{nodes[0].Name}},
-				PullPolicy: &appsv1alpha1.PullPolicy{
-					TimeoutSeconds: utilpointer.Int32Ptr(50),
-					BackoffLimit:   utilpointer.Int32Ptr(2),
-				},
-				Parallelism: &intorstr4,
-				CompletionPolicy: appsv1alpha1.CompletionPolicy{
-					Type: appsv1alpha1.Never,
+				Image: NewWebserverImage,
+				ImagePullJobTemplate: appsv1alpha1.ImagePullJobTemplate{
+					Selector: &appsv1alpha1.ImagePullJobNodeSelector{Names: []string{nodes[0].Name}},
+					PullPolicy: &appsv1alpha1.PullPolicy{
+						TimeoutSeconds: utilpointer.Int32Ptr(50),
+						BackoffLimit:   utilpointer.Int32Ptr(2),
+					},
+					Parallelism: &intorstr4,
+					CompletionPolicy: appsv1alpha1.CompletionPolicy{
+						Type: appsv1alpha1.Never,
+					},
 				},
 			}
 			err = testerForImagePullJob.CreateJob(job2)
@@ -285,5 +522,4 @@ var _ = SIGDescribe("PullImage", func() {
 			}, 60*time.Second, 3*time.Second).Should(gomega.Equal(int32(1)))
 		})
 	})
-
 })

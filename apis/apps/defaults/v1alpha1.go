@@ -24,6 +24,12 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	v1 "k8s.io/kubernetes/pkg/apis/core/v1"
 	utilpointer "k8s.io/utils/pointer"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+)
+
+const (
+	// ProtectionFinalizer is designed to ensure the GC of resources.
+	ProtectionFinalizer = "apps.kruise.io/deletion-protection"
 )
 
 // SetDefaults_SidecarSet set default values for SidecarSet.
@@ -31,11 +37,11 @@ func SetDefaultsSidecarSet(obj *v1alpha1.SidecarSet) {
 	setSidecarSetUpdateStrategy(&obj.Spec.UpdateStrategy)
 
 	for i := range obj.Spec.InitContainers {
-		setSidecarDefaultContainer(&obj.Spec.InitContainers[i])
+		setDefaultSidecarContainer(&obj.Spec.InitContainers[i], v1alpha1.AfterAppContainerType)
 	}
 
 	for i := range obj.Spec.Containers {
-		setDefaultSidecarContainer(&obj.Spec.Containers[i])
+		setDefaultSidecarContainer(&obj.Spec.Containers[i], v1alpha1.BeforeAppContainerType)
 	}
 
 	//default setting volumes
@@ -43,6 +49,23 @@ func SetDefaultsSidecarSet(obj *v1alpha1.SidecarSet) {
 
 	//default setting history revision limitation
 	SetDefaultRevisionHistoryLimit(&obj.Spec.RevisionHistoryLimit)
+
+	// default patchPolicy is 'Retain'
+	for i := range obj.Spec.PatchPodMetadata {
+		patch := &obj.Spec.PatchPodMetadata[i]
+		if patch.PatchPolicy == "" {
+			patch.PatchPolicy = v1alpha1.SidecarSetRetainPatchPolicy
+		}
+	}
+
+	//default setting injectRevisionStrategy
+	SetDefaultInjectRevision(&obj.Spec.InjectionStrategy)
+}
+
+func SetDefaultInjectRevision(strategy *v1alpha1.SidecarSetInjectionStrategy) {
+	if strategy.Revision != nil && strategy.Revision.Policy == "" {
+		strategy.Revision.Policy = v1alpha1.AlwaysSidecarSetInjectRevisionPolicy
+	}
 }
 
 func SetDefaultRevisionHistoryLimit(revisionHistoryLimit **int32) {
@@ -51,9 +74,9 @@ func SetDefaultRevisionHistoryLimit(revisionHistoryLimit **int32) {
 	}
 }
 
-func setDefaultSidecarContainer(sidecarContainer *v1alpha1.SidecarContainer) {
+func setDefaultSidecarContainer(sidecarContainer *v1alpha1.SidecarContainer, injectPolicy v1alpha1.PodInjectPolicyType) {
 	if sidecarContainer.PodInjectPolicy == "" {
-		sidecarContainer.PodInjectPolicy = v1alpha1.BeforeAppContainerType
+		sidecarContainer.PodInjectPolicy = injectPolicy
 	}
 	if sidecarContainer.UpgradeStrategy.UpgradeType == "" {
 		sidecarContainer.UpgradeStrategy.UpgradeType = v1alpha1.SidecarContainerColdUpgrade
@@ -62,7 +85,7 @@ func setDefaultSidecarContainer(sidecarContainer *v1alpha1.SidecarContainer) {
 		sidecarContainer.ShareVolumePolicy.Type = v1alpha1.ShareVolumePolicyDisabled
 	}
 
-	setSidecarDefaultContainer(sidecarContainer)
+	setDefaultContainer(sidecarContainer)
 }
 
 func setSidecarSetUpdateStrategy(strategy *v1alpha1.SidecarSetUpdateStrategy) {
@@ -79,7 +102,7 @@ func setSidecarSetUpdateStrategy(strategy *v1alpha1.SidecarSetUpdateStrategy) {
 	}
 }
 
-func setSidecarDefaultContainer(sidecarContainer *v1alpha1.SidecarContainer) {
+func setDefaultContainer(sidecarContainer *v1alpha1.SidecarContainer) {
 	container := &sidecarContainer.Container
 	v1.SetDefaults_Container(container)
 	for i := range container.Ports {
@@ -106,14 +129,14 @@ func setSidecarDefaultContainer(sidecarContainer *v1alpha1.SidecarContainer) {
 	v1.SetDefaults_ResourceList(&container.Resources.Requests)
 	if container.LivenessProbe != nil {
 		v1.SetDefaults_Probe(container.LivenessProbe)
-		if container.LivenessProbe.Handler.HTTPGet != nil {
-			v1.SetDefaults_HTTPGetAction(container.LivenessProbe.Handler.HTTPGet)
+		if container.LivenessProbe.ProbeHandler.HTTPGet != nil {
+			v1.SetDefaults_HTTPGetAction(container.LivenessProbe.ProbeHandler.HTTPGet)
 		}
 	}
 	if container.ReadinessProbe != nil {
 		v1.SetDefaults_Probe(container.ReadinessProbe)
-		if container.ReadinessProbe.Handler.HTTPGet != nil {
-			v1.SetDefaults_HTTPGetAction(container.ReadinessProbe.Handler.HTTPGet)
+		if container.ReadinessProbe.ProbeHandler.HTTPGet != nil {
+			v1.SetDefaults_HTTPGetAction(container.ReadinessProbe.ProbeHandler.HTTPGet)
 		}
 	}
 	if container.Lifecycle != nil {
@@ -175,13 +198,15 @@ func SetDefaultsBroadcastJob(obj *v1alpha1.BroadcastJob, injectTemplateDefaults 
 	if obj.Spec.FailurePolicy.Type == "" {
 		obj.Spec.FailurePolicy.Type = v1alpha1.FailurePolicyTypeFailFast
 	}
+
+	// Default to 'OnFailure' if no restartPolicy is specified
+	if obj.Spec.Template.Spec.RestartPolicy == "" {
+		obj.Spec.Template.Spec.RestartPolicy = corev1.RestartPolicyOnFailure
+	}
 }
 
 // SetDefaults_UnitedDeployment set default values for UnitedDeployment.
 func SetDefaultsUnitedDeployment(obj *v1alpha1.UnitedDeployment, injectTemplateDefaults bool) {
-	if obj.Spec.Replicas == nil {
-		obj.Spec.Replicas = utilpointer.Int32Ptr(1)
-	}
 	if obj.Spec.RevisionHistoryLimit == nil {
 		obj.Spec.RevisionHistoryLimit = utilpointer.Int32Ptr(10)
 	}
@@ -203,6 +228,25 @@ func SetDefaultsUnitedDeployment(obj *v1alpha1.UnitedDeployment, injectTemplateD
 				v1.SetDefaults_ResourceList(&a.Spec.Resources.Limits)
 				v1.SetDefaults_ResourceList(&a.Spec.Resources.Requests)
 				v1.SetDefaults_ResourceList(&a.Status.Capacity)
+			}
+		}
+	}
+
+	hasReplicasSettings := false
+	hasCapacitySettings := false
+	for _, subset := range obj.Spec.Topology.Subsets {
+		if subset.Replicas != nil {
+			hasReplicasSettings = true
+		}
+		if subset.MinReplicas != nil || subset.MaxReplicas != nil {
+			hasCapacitySettings = true
+		}
+	}
+	if hasCapacitySettings && !hasReplicasSettings {
+		for i := range obj.Spec.Topology.Subsets {
+			subset := &obj.Spec.Topology.Subsets[i]
+			if subset.MinReplicas == nil {
+				subset.MinReplicas = &intstr.IntOrString{Type: intstr.Int, IntVal: 0}
 			}
 		}
 	}
@@ -260,33 +304,34 @@ func SetDefaultsDaemonSet(obj *v1alpha1.DaemonSet) {
 
 	if obj.Spec.UpdateStrategy.Type == "" {
 		obj.Spec.UpdateStrategy.Type = v1alpha1.RollingUpdateDaemonSetStrategyType
-
-		// UpdateStrategy.RollingUpdate will take default values below.
-		obj.Spec.UpdateStrategy.RollingUpdate = &v1alpha1.RollingUpdateDaemonSet{}
 	}
-
 	if obj.Spec.UpdateStrategy.Type == v1alpha1.RollingUpdateDaemonSetStrategyType {
 		if obj.Spec.UpdateStrategy.RollingUpdate == nil {
 			obj.Spec.UpdateStrategy.RollingUpdate = &v1alpha1.RollingUpdateDaemonSet{}
 		}
-		if obj.Spec.UpdateStrategy.RollingUpdate.Partition == nil {
-			obj.Spec.UpdateStrategy.RollingUpdate.Partition = new(int32)
-			*obj.Spec.UpdateStrategy.RollingUpdate.Partition = 0
-		}
-		if obj.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable == nil {
-			maxUnavailable := intstr.FromInt(1)
-			obj.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable = &maxUnavailable
+
+		// Make it compatible with the predicated Surging
+		if obj.Spec.UpdateStrategy.RollingUpdate.Type == v1alpha1.DeprecatedSurgingRollingUpdateType {
+			if obj.Spec.UpdateStrategy.RollingUpdate.MaxSurge == nil {
+				maxSurge := intstr.FromInt(1)
+				obj.Spec.UpdateStrategy.RollingUpdate.MaxSurge = &maxSurge
+			}
+			if obj.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable == nil {
+				maxUnavailable := intstr.FromInt(0)
+				obj.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable = &maxUnavailable
+			}
 		}
 
-		if obj.Spec.UpdateStrategy.RollingUpdate.Type == "" {
+		// Default and convert to Standard
+		if obj.Spec.UpdateStrategy.RollingUpdate.Type == "" || obj.Spec.UpdateStrategy.RollingUpdate.Type == v1alpha1.DeprecatedSurgingRollingUpdateType {
 			obj.Spec.UpdateStrategy.RollingUpdate.Type = v1alpha1.StandardRollingUpdateType
 		}
-		// Only when RollingUpdate Type is SurgingRollingUpdateType, it need to initialize the MaxSurge.
-		if obj.Spec.UpdateStrategy.RollingUpdate.Type == v1alpha1.SurgingRollingUpdateType {
-			if obj.Spec.UpdateStrategy.RollingUpdate.MaxSurge == nil {
-				MaxSurge := intstr.FromInt(1)
-				obj.Spec.UpdateStrategy.RollingUpdate.MaxSurge = &MaxSurge
-			}
+
+		if obj.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable == nil && obj.Spec.UpdateStrategy.RollingUpdate.MaxSurge == nil {
+			maxUnavailable := intstr.FromInt(1)
+			obj.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable = &maxUnavailable
+			MaxSurge := intstr.FromInt(0)
+			obj.Spec.UpdateStrategy.RollingUpdate.MaxSurge = &MaxSurge
 		}
 	}
 
@@ -333,7 +378,29 @@ func SetDefaultsImageTagPullPolicy(obj *v1alpha1.ImageTagPullPolicy) {
 }
 
 // SetDefaults_ImagePullJob set default values for ImagePullJob.
-func SetDefaultsImagePullJob(obj *v1alpha1.ImagePullJob) {
+func SetDefaultsImagePullJob(obj *v1alpha1.ImagePullJob, addProtection bool) {
+	if obj.Spec.CompletionPolicy.Type == "" {
+		obj.Spec.CompletionPolicy.Type = v1alpha1.Always
+	}
+	if obj.Spec.PullPolicy == nil {
+		obj.Spec.PullPolicy = &v1alpha1.PullPolicy{}
+	}
+	if obj.Spec.PullPolicy.TimeoutSeconds == nil {
+		obj.Spec.PullPolicy.TimeoutSeconds = utilpointer.Int32Ptr(600)
+	}
+	if obj.Spec.PullPolicy.BackoffLimit == nil {
+		obj.Spec.PullPolicy.BackoffLimit = utilpointer.Int32Ptr(3)
+	}
+	if obj.Spec.ImagePullPolicy == "" {
+		obj.Spec.ImagePullPolicy = v1alpha1.PullIfNotPresent
+	}
+	if addProtection {
+		controllerutil.AddFinalizer(obj, ProtectionFinalizer)
+	}
+}
+
+// SetDefaultsImageListPullJob  set default values for ImageListPullJob.
+func SetDefaultsImageListPullJob(obj *v1alpha1.ImageListPullJob) {
 	if obj.Spec.CompletionPolicy.Type == "" {
 		obj.Spec.CompletionPolicy.Type = v1alpha1.Always
 	}

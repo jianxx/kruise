@@ -18,12 +18,19 @@ package validating
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/strategicpatch"
+
+	webhookutil "github.com/openkruise/kruise/pkg/webhook/util"
+	"github.com/openkruise/kruise/pkg/webhook/util/convertor"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -35,6 +42,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
+	appsvbeta1 "github.com/openkruise/kruise/apis/apps/v1beta1"
+	"github.com/openkruise/kruise/pkg/util/configuration"
 )
 
 const (
@@ -42,16 +51,19 @@ const (
 )
 
 var (
-	controllerKruiseKindCS = appsv1alpha1.SchemeGroupVersion.WithKind("CloneSet")
-	controllerKindRS       = appsv1.SchemeGroupVersion.WithKind("ReplicaSet")
-	controllerKindDep      = appsv1.SchemeGroupVersion.WithKind("Deployment")
-	controllerKindJob      = batchv1.SchemeGroupVersion.WithKind("Job")
+	controllerKruiseKindCS       = appsv1alpha1.SchemeGroupVersion.WithKind("CloneSet")
+	controllerKindSts            = appsv1.SchemeGroupVersion.WithKind("StatefulSet")
+	controllerKindRS             = appsv1.SchemeGroupVersion.WithKind("ReplicaSet")
+	controllerKindDep            = appsv1.SchemeGroupVersion.WithKind("Deployment")
+	controllerKindJob            = batchv1.SchemeGroupVersion.WithKind("Job")
+	controllerKruiseKindBetaSts  = appsvbeta1.SchemeGroupVersion.WithKind("StatefulSet")
+	controllerKruiseKindAlphaSts = appsv1alpha1.SchemeGroupVersion.WithKind("StatefulSet")
 )
 
 func verifyGroupKind(ref *appsv1alpha1.TargetReference, expectedKind string, expectedGroups []string) (bool, error) {
 	gv, err := schema.ParseGroupVersion(ref.APIVersion)
 	if err != nil {
-		klog.Errorf("failed to parse GroupVersion for apiVersion (%s): %s", ref.APIVersion, err.Error())
+		klog.ErrorS(err, "failed to parse GroupVersion for apiVersion", "apiVersion", ref.APIVersion)
 		return false, err
 	}
 
@@ -70,7 +82,7 @@ func verifyGroupKind(ref *appsv1alpha1.TargetReference, expectedKind string, exp
 
 func (h *WorkloadSpreadCreateUpdateHandler) validatingWorkloadSpreadFn(obj *appsv1alpha1.WorkloadSpread) field.ErrorList {
 	// validate ws.spec.
-	allErrs := validateWorkloadSpreadSpec(obj, field.NewPath("spec"))
+	allErrs := validateWorkloadSpreadSpec(h, obj, field.NewPath("spec"))
 
 	// validate whether ws.spec.targetRef is in conflict with others.
 	wsList := &appsv1alpha1.WorkloadSpreadList{}
@@ -83,9 +95,10 @@ func (h *WorkloadSpreadCreateUpdateHandler) validatingWorkloadSpreadFn(obj *apps
 	return allErrs
 }
 
-func validateWorkloadSpreadSpec(obj *appsv1alpha1.WorkloadSpread, fldPath *field.Path) field.ErrorList {
+func validateWorkloadSpreadSpec(h *WorkloadSpreadCreateUpdateHandler, obj *appsv1alpha1.WorkloadSpread, fldPath *field.Path) field.ErrorList {
 	spec := &obj.Spec
 	allErrs := field.ErrorList{}
+	var workloadTemplate client.Object
 
 	// validate targetRef
 	if spec.TargetReference == nil {
@@ -99,30 +112,74 @@ func validateWorkloadSpreadSpec(obj *appsv1alpha1.WorkloadSpread, fldPath *field
 				ok, err := verifyGroupKind(spec.TargetReference, controllerKruiseKindCS.Kind, []string{controllerKruiseKindCS.Group})
 				if !ok || err != nil {
 					allErrs = append(allErrs, field.Invalid(fldPath.Child("targetRef"), spec.TargetReference, "TargetReference is not valid for CloneSet."))
+				} else {
+					set := &appsv1alpha1.CloneSet{}
+					if getErr := h.Client.Get(context.TODO(), client.ObjectKey{Name: spec.TargetReference.Name, Namespace: obj.Namespace}, set); getErr == nil {
+						workloadTemplate = set
+					}
 				}
 			case controllerKindDep.Kind:
 				ok, err := verifyGroupKind(spec.TargetReference, controllerKindDep.Kind, []string{controllerKindDep.Group})
 				if !ok || err != nil {
 					allErrs = append(allErrs, field.Invalid(fldPath.Child("targetRef"), spec.TargetReference, "TargetReference is not valid for Deployment."))
+				} else {
+					set := &appsv1.Deployment{}
+					if getErr := h.Client.Get(context.TODO(), client.ObjectKey{Name: spec.TargetReference.Name, Namespace: obj.Namespace}, set); getErr == nil {
+						workloadTemplate = set
+					}
 				}
 			case controllerKindRS.Kind:
 				ok, err := verifyGroupKind(spec.TargetReference, controllerKindRS.Kind, []string{controllerKindRS.Group})
 				if !ok || err != nil {
 					allErrs = append(allErrs, field.Invalid(fldPath.Child("targetRef"), spec.TargetReference, "TargetReference is not valid for ReplicaSet."))
+				} else {
+					set := &appsv1.ReplicaSet{}
+					if getErr := h.Client.Get(context.TODO(), client.ObjectKey{Name: spec.TargetReference.Name, Namespace: obj.Namespace}, set); getErr == nil {
+						workloadTemplate = set
+					}
 				}
 			case controllerKindJob.Kind:
 				ok, err := verifyGroupKind(spec.TargetReference, controllerKindJob.Kind, []string{controllerKindJob.Group})
 				if !ok || err != nil {
 					allErrs = append(allErrs, field.Invalid(fldPath.Child("targetRef"), spec.TargetReference, "TargetReference is not valid for Job."))
+				} else {
+					set := &batchv1.Job{}
+					if getErr := h.Client.Get(context.TODO(), client.ObjectKey{Name: spec.TargetReference.Name, Namespace: obj.Namespace}, set); getErr == nil {
+						workloadTemplate = set
+					}
+				}
+			case controllerKindSts.Kind:
+				ok, err := verifyGroupKind(spec.TargetReference, controllerKindSts.Kind, []string{controllerKindSts.Group, controllerKruiseKindAlphaSts.Group, controllerKruiseKindBetaSts.Group})
+				if !ok || err != nil {
+					allErrs = append(allErrs, field.Invalid(fldPath.Child("targetRef"), spec.TargetReference, "TargetReference is not valid for StatefulSet."))
+				} else {
+					set := &appsv1.StatefulSet{}
+					if getErr := h.Client.Get(context.TODO(), client.ObjectKey{Name: spec.TargetReference.Name, Namespace: obj.Namespace}, workloadTemplate); getErr == nil {
+						workloadTemplate = set
+					}
 				}
 			default:
-				allErrs = append(allErrs, field.Invalid(fldPath.Child("targetRef"), spec.TargetReference, "TargetReference's GroupKind is not permitted."))
+				whiteList, err := configuration.GetWSWatchCustomWorkloadWhiteList(h.Client)
+				if err != nil {
+					allErrs = append(allErrs, field.InternalError(fldPath.Child("targetRef"), err))
+					break
+				}
+				matched := false
+				for _, wl := range whiteList.Workloads {
+					if ok, _ := verifyGroupKind(spec.TargetReference, wl.Kind, []string{wl.Group}); ok {
+						matched = true
+						break
+					}
+				}
+				if !matched {
+					allErrs = append(allErrs, field.Invalid(fldPath.Child("targetRef"), spec.TargetReference, "TargetReference's GroupKind is not permitted."))
+				}
 			}
 		}
 	}
 
 	// validate subsets
-	allErrs = append(allErrs, validateWorkloadSpreadSubsets(spec.Subsets, fldPath.Child("subsets"))...)
+	allErrs = append(allErrs, validateWorkloadSpreadSubsets(obj, spec.Subsets, workloadTemplate, fldPath.Child("subsets"))...)
 
 	// validate scheduleStrategy
 	if spec.ScheduleStrategy.Type != "" &&
@@ -140,7 +197,7 @@ func validateWorkloadSpreadSpec(obj *appsv1alpha1.WorkloadSpread, fldPath *field
 
 		if len(spec.Subsets) > 1 && spec.Subsets[len(spec.Subsets)-1].MaxReplicas != nil {
 			allErrs = append(allErrs, field.Invalid(fldPath.Child("scheduleStrategy").Child("adaptive"),
-				spec.ScheduleStrategy.Adaptive.RescheduleCriticalSeconds, "the last subset must be not specified when using adaptive scheduleStrategy"))
+				spec.ScheduleStrategy.Adaptive.RescheduleCriticalSeconds, "the last subset's maxReplicas must be not specified when using adaptive scheduleStrategy"))
 		}
 
 		allowedMaxSeconds := int32(math.MaxInt32)
@@ -157,10 +214,17 @@ func validateWorkloadSpreadSpec(obj *appsv1alpha1.WorkloadSpread, fldPath *field
 		}
 	}
 
+	// validate targetFilter
+	if spec.TargetFilter != nil {
+		if _, err := metav1.LabelSelectorAsSelector(spec.TargetFilter.Selector); err != nil {
+			allErrs = append(allErrs, field.Invalid(fldPath.Child("targetFilter"), spec.TargetFilter, err.Error()))
+		}
+	}
+
 	return allErrs
 }
 
-func validateWorkloadSpreadSubsets(subsets []appsv1alpha1.WorkloadSpreadSubset, fldPath *field.Path) field.ErrorList {
+func validateWorkloadSpreadSubsets(ws *appsv1alpha1.WorkloadSpread, subsets []appsv1alpha1.WorkloadSpreadSubset, workloadTemplate client.Object, fldPath *field.Path) field.ErrorList {
 	allErrs := field.ErrorList{}
 
 	//if len(subsets) < 2 {
@@ -230,7 +294,41 @@ func validateWorkloadSpreadSubsets(subsets []appsv1alpha1.WorkloadSpreadSubset, 
 			allErrs = append(allErrs, corevalidation.ValidateTolerations(coreTolerations, fldPath.Index(i).Child("tolerations"))...)
 		}
 
-		//TODO validate patch
+		if subset.Patch.Raw != nil {
+			// In the case the WorkloadSpread is created before the workload,so no workloadTemplate is obtained, skip the remaining checks.
+			if workloadTemplate != nil {
+				// get the PodTemplateSpec from the workload
+				var podSpec v1.PodTemplateSpec
+				switch workloadTemplate.GetObjectKind().GroupVersionKind() {
+				case controllerKruiseKindCS:
+					cs := workloadTemplate.(*appsv1alpha1.CloneSet)
+					podSpec = withVolumeClaimTemplates(cs.Spec.Template, cs.Spec.VolumeClaimTemplates)
+				case controllerKindDep:
+					podSpec = workloadTemplate.(*appsv1.Deployment).Spec.Template
+				case controllerKindRS:
+					podSpec = workloadTemplate.(*appsv1.ReplicaSet).Spec.Template
+				case controllerKindJob:
+					podSpec = workloadTemplate.(*batchv1.Job).Spec.Template
+				case controllerKindSts:
+					sts := workloadTemplate.(*appsv1.StatefulSet)
+					podSpec = withVolumeClaimTemplates(sts.Spec.Template, sts.Spec.VolumeClaimTemplates)
+				}
+				podBytes, _ := json.Marshal(podSpec)
+				modified, err := strategicpatch.StrategicMergePatch(podBytes, subset.Patch.Raw, &v1.Pod{})
+				if err != nil {
+					allErrs = append(allErrs, field.Invalid(fldPath.Index(i).Child("patch"), string(subset.Patch.Raw), fmt.Sprintf("failed to merge patch: %v", err)))
+				}
+				newPod := &v1.Pod{}
+				if err = json.Unmarshal(modified, newPod); err != nil {
+					allErrs = append(allErrs, field.Invalid(fldPath.Index(i).Child("patch"), string(subset.Patch.Raw), fmt.Sprintf("failed to unmarshal: %v", err)))
+				}
+				coreNewPod, CovErr := convertor.ConvertPod(newPod)
+				if CovErr != nil {
+					allErrs = append(allErrs, field.Invalid(fldPath.Index(i).Child("patch"), newPod, fmt.Sprintf("Convert_v1_Pod_To_core_Pod failed: %v", err)))
+				}
+				allErrs = append(allErrs, corevalidation.ValidatePodSpec(&coreNewPod.Spec, &coreNewPod.ObjectMeta, fldPath.Index(i).Child("patch"), webhookutil.DefaultPodValidationOptions)...)
+			}
+		}
 
 		//1. All subset maxReplicas must be the same type: int or percent.
 		//2. Adaptive: the last subset must be not specified.
@@ -240,6 +338,11 @@ func validateWorkloadSpreadSubsets(subsets []appsv1alpha1.WorkloadSpreadSubset, 
 				firstMaxReplicasType = &subset.MaxReplicas.Type
 			} else if subset.MaxReplicas.Type != *firstMaxReplicasType {
 				allErrs = append(allErrs, field.Invalid(fldPath.Index(i).Child("maxReplicas"), subset.MaxReplicas, "the maxReplicas type of all subsets must be the same"))
+				return allErrs
+			}
+
+			if ws.Spec.TargetReference != nil && ws.Spec.TargetReference.Kind == controllerKindSts.Kind && subset.MaxReplicas.Type != intstr.Int {
+				allErrs = append(allErrs, field.Invalid(fldPath.Index(i).Child("maxReplicas"), subset.MaxReplicas, "the maxReplicas type must be Int for StatefulSet"))
 				return allErrs
 			}
 
@@ -263,6 +366,20 @@ func validateWorkloadSpreadSubsets(subsets []appsv1alpha1.WorkloadSpreadSubset, 
 		allErrs = append(allErrs, field.Invalid(fldPath.Index(0).Child("maxReplicas"), subsets[0].MaxReplicas, "maxReplicas sum of all subsets must equal 100% when type is specified as percent"))
 	}
 	return allErrs
+}
+
+func withVolumeClaimTemplates(pod v1.PodTemplateSpec, claims []v1.PersistentVolumeClaim) v1.PodTemplateSpec {
+	for _, pvc := range claims {
+		pod.Spec.Volumes = append(pod.Spec.Volumes, v1.Volume{
+			Name: pvc.Name,
+			VolumeSource: v1.VolumeSource{
+				PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+					ClaimName: pvc.Name,
+				},
+			},
+		})
+	}
+	return pod
 }
 
 func validateWorkloadSpreadConflict(ws *appsv1alpha1.WorkloadSpread, others []appsv1alpha1.WorkloadSpread, fldPath *field.Path) field.ErrorList {

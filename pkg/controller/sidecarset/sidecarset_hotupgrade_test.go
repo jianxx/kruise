@@ -22,7 +22,7 @@ import (
 
 	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
 	"github.com/openkruise/kruise/pkg/control/sidecarcontrol"
-	"github.com/openkruise/kruise/pkg/util/expectations"
+	"github.com/openkruise/kruise/pkg/util"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -243,13 +243,13 @@ func testUpdateHotUpgradeSidecar(t *testing.T, hotUpgradeEmptyImage string, side
 			expectedStatus: []int32{1, 1, 1, 1},
 		},
 	}
-	exps := expectations.NewUpdateExpectations(sidecarcontrol.RevisionAdapterImpl)
 	for _, cs := range cases {
 		t.Run(cs.name, func(t *testing.T) {
 			pod := cs.getPods()[0]
 			sidecarset := cs.getSidecarset()
-			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sidecarset, pod).Build()
-			processor := NewSidecarSetProcessor(fakeClient, exps, record.NewFakeRecorder(10))
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sidecarset, pod).
+				WithStatusSubresource(&appsv1alpha1.SidecarSet{}).Build()
+			processor := NewSidecarSetProcessor(fakeClient, record.NewFakeRecorder(10))
 			_, err := processor.UpdateSidecarSet(sidecarset)
 			if err != nil {
 				t.Errorf("processor update sidecarset failed: %s", err.Error())
@@ -260,7 +260,7 @@ func testUpdateHotUpgradeSidecar(t *testing.T, hotUpgradeEmptyImage string, side
 			}
 			podInput = podOutput.DeepCopy()
 			for cName, infos := range cs.expectedInfo {
-				sidecarContainer := getPodContainerByName(cName, podOutput)
+				sidecarContainer := util.GetPodContainerByName(cName, podOutput)
 				if infos[0] != sidecarContainer.Image {
 					t.Fatalf("expect pod(%s) container(%s) image(%s), but get image(%s)", pod.Name, sidecarContainer.Name, infos[0], sidecarContainer.Image)
 				}
@@ -294,14 +294,4 @@ func testUpdateHotUpgradeSidecar(t *testing.T, hotUpgradeEmptyImage string, side
 			}
 		})
 	}
-}
-
-func getPodContainerByName(cName string, pod *corev1.Pod) *corev1.Container {
-	for _, container := range pod.Spec.Containers {
-		if cName == container.Name {
-			return &container
-		}
-	}
-
-	return nil
 }

@@ -18,8 +18,10 @@ package validating
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 
+	"github.com/openkruise/kruise/pkg/util"
 	"github.com/openkruise/kruise/pkg/webhook/util/deletionprotection"
 	admissionv1 "k8s.io/api/admission/v1"
 	apps "k8s.io/api/apps/v1"
@@ -45,7 +47,7 @@ func (h *WorkloadHandler) Handle(ctx context.Context, req admission.Request) adm
 		return admission.ValidationResponse(true, "")
 	}
 	if len(req.OldObject.Raw) == 0 {
-		klog.Warningf("Skip to validate %s %s/%s for no old object, maybe because of Kubernetes version < 1.16", req.Kind.Kind, req.Namespace, req.Name)
+		klog.InfoS("Skip to validate for no old object, maybe because of Kubernetes version < 1.16", "kind", req.Kind.Kind, "namespace", req.Namespace, "name", req.Name)
 		return admission.ValidationResponse(true, "")
 	}
 
@@ -74,11 +76,13 @@ func (h *WorkloadHandler) Handle(ctx context.Context, req admission.Request) adm
 		metaObj = obj
 		replicas = obj.Spec.Replicas
 	default:
-		klog.Warningf("Skip to validate %s %s/%s for unsupported resource", req.Kind.Kind, req.Namespace, req.Name)
+		klog.InfoS("Skip to validate for unsupported resource", "kind", req.Kind.Kind, "namespace", req.Namespace, "name", req.Name)
 		return admission.ValidationResponse(true, "")
 	}
 
 	if err := deletionprotection.ValidateWorkloadDeletion(metaObj, replicas); err != nil {
+		deletionprotection.WorkloadDeletionProtectionMetrics.WithLabelValues(fmt.Sprintf("%s_%s_%s", req.Kind.Kind, metaObj.GetNamespace(), metaObj.GetName()), req.UserInfo.Username).Add(1)
+		util.LoggerProtectionInfo(util.ProtectionEventDeletionProtection, req.Kind.Kind, metaObj.GetNamespace(), metaObj.GetName(), req.UserInfo.Username)
 		return admission.Errored(http.StatusForbidden, err)
 	}
 	return admission.ValidationResponse(true, "")

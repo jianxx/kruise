@@ -22,12 +22,6 @@ import (
 	"fmt"
 	"reflect"
 
-	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
-	"github.com/openkruise/kruise/pkg/util"
-	utildiscovery "github.com/openkruise/kruise/pkg/util/discovery"
-	"github.com/openkruise/kruise/pkg/util/ratelimiter"
-	utils "github.com/openkruise/kruise/pkg/webhook/resourcedistribution/validating"
-
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -45,6 +39,15 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
+
+	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
+	"github.com/openkruise/kruise/pkg/features"
+	"github.com/openkruise/kruise/pkg/util"
+	utilclient "github.com/openkruise/kruise/pkg/util/client"
+	utildiscovery "github.com/openkruise/kruise/pkg/util/discovery"
+	utilfeature "github.com/openkruise/kruise/pkg/util/feature"
+	"github.com/openkruise/kruise/pkg/util/ratelimiter"
+	utils "github.com/openkruise/kruise/pkg/webhook/resourcedistribution/validating"
 )
 
 func init() {
@@ -59,7 +62,7 @@ var (
 // Add creates a new ResourceDistribution Controller and adds it to the Manager with default RBAC. The Manager will set fields on the Controller
 // and Start it when the Manager is Started.
 func Add(mgr manager.Manager) error {
-	if !utildiscovery.DiscoverGVK(controllerKind) {
+	if !utildiscovery.DiscoverGVK(controllerKind) || !utilfeature.DefaultFeatureGate.Enabled(features.ResourceDistributionGate) {
 		return nil
 	}
 	return add(mgr, newReconciler(mgr))
@@ -67,7 +70,7 @@ func Add(mgr manager.Manager) error {
 
 // newReconciler returns a new reconcile.Reconciler
 func newReconciler(mgr manager.Manager) reconcile.Reconciler {
-	cli := util.NewClientFromManager(mgr, "resourcedistribution-controller")
+	cli := utilclient.NewClientFromManager(mgr, "resourcedistribution-controller")
 	return &ReconcileResourceDistribution{
 		Client: cli,
 		scheme: mgr.GetScheme(),
@@ -78,19 +81,19 @@ func newReconciler(mgr manager.Manager) reconcile.Reconciler {
 func add(mgr manager.Manager, r reconcile.Reconciler) error {
 	// Create a new controller
 	c, err := controller.New("resourcedistribution-controller", mgr, controller.Options{
-		Reconciler: r, MaxConcurrentReconciles: concurrentReconciles,
+		Reconciler: r, MaxConcurrentReconciles: concurrentReconciles, CacheSyncTimeout: util.GetControllerCacheSyncTimeout(),
 		RateLimiter: ratelimiter.DefaultControllerRateLimiter()})
 	if err != nil {
 		return err
 	}
 
 	// Watch for changes to ResourceDistribution
-	err = c.Watch(&source.Kind{Type: &appsv1alpha1.ResourceDistribution{}}, &handler.EnqueueRequestForObject{}, predicate.Funcs{
+	err = c.Watch(source.Kind(mgr.GetCache(), &appsv1alpha1.ResourceDistribution{}), &handler.EnqueueRequestForObject{}, predicate.Funcs{
 		UpdateFunc: func(e event.UpdateEvent) bool {
 			oldObj := e.ObjectOld.(*appsv1alpha1.ResourceDistribution)
 			newObj := e.ObjectNew.(*appsv1alpha1.ResourceDistribution)
 			if !reflect.DeepEqual(oldObj.Spec, newObj.Spec) {
-				klog.V(3).Infof("Observed updated Spec for ResourceDistribution: %s/%s", oldObj.Namespace, newObj.Name)
+				klog.V(3).InfoS("Observed updated Spec for ResourceDistribution", "resourceDistribution", klog.KObj(oldObj))
 				return true
 			}
 			return false
@@ -101,47 +104,41 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 	}
 
 	// Watch for changes to all namespaces
-	err = c.Watch(&source.Kind{Type: &corev1.Namespace{}}, &enqueueRequestForNamespace{reader: mgr.GetCache()})
+	err = c.Watch(source.Kind(mgr.GetCache(), &corev1.Namespace{}), &enqueueRequestForNamespace{reader: mgr.GetCache()})
 	if err != nil {
 		return err
 	}
 
 	// Watch for changes to Secrets
-	err = c.Watch(&source.Kind{Type: &corev1.Secret{}}, &handler.EnqueueRequestForOwner{
-		IsController: true, OwnerType: &appsv1alpha1.ResourceDistribution{},
-	}, predicate.Funcs{
-		CreateFunc: func(createEvent event.CreateEvent) bool {
-			return false
-		},
-		UpdateFunc: func(updateEvent event.UpdateEvent) bool {
-			oldObject, oldOK := updateEvent.ObjectOld.(*corev1.Secret)
-			newObject, newOK := updateEvent.ObjectNew.(*corev1.Secret)
-			if !oldOK || !newOK {
+	secret := unstructured.Unstructured{}
+	secret.SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("Secret"))
+	err = c.Watch(source.Kind(mgr.GetCache(), &secret), handler.EnqueueRequestForOwner(
+		mgr.GetScheme(), mgr.GetRESTMapper(), &appsv1alpha1.ResourceDistribution{}, handler.OnlyControllerOwner()),
+		predicate.Funcs{
+			CreateFunc: func(createEvent event.CreateEvent) bool {
 				return false
-			}
-			return !reflect.DeepEqual(oldObject.Data, newObject.Data) || !reflect.DeepEqual(oldObject.StringData, newObject.StringData)
-		},
-	})
+			},
+			GenericFunc: func(genericEvent event.GenericEvent) bool {
+				return false
+			},
+		})
 	if err != nil {
 		return err
 	}
 
 	// Watch for changes to ConfigMap
-	err = c.Watch(&source.Kind{Type: &corev1.ConfigMap{}}, &handler.EnqueueRequestForOwner{
-		IsController: true, OwnerType: &appsv1alpha1.ResourceDistribution{},
-	}, predicate.Funcs{
-		CreateFunc: func(createEvent event.CreateEvent) bool {
-			return false
-		},
-		UpdateFunc: func(updateEvent event.UpdateEvent) bool {
-			oldObject, oldOK := updateEvent.ObjectOld.(*corev1.ConfigMap)
-			newObject, newOK := updateEvent.ObjectNew.(*corev1.ConfigMap)
-			if !oldOK || !newOK {
+	configMap := unstructured.Unstructured{}
+	configMap.SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("ConfigMap"))
+	err = c.Watch(source.Kind(mgr.GetCache(), &configMap), handler.EnqueueRequestForOwner(
+		mgr.GetScheme(), mgr.GetRESTMapper(), &appsv1alpha1.ResourceDistribution{}, handler.OnlyControllerOwner()),
+		predicate.Funcs{
+			CreateFunc: func(createEvent event.CreateEvent) bool {
 				return false
-			}
-			return !reflect.DeepEqual(oldObject.Data, newObject.Data) || !reflect.DeepEqual(oldObject.BinaryData, newObject.BinaryData)
-		},
-	})
+			},
+			GenericFunc: func(genericEvent event.GenericEvent) bool {
+				return false
+			},
+		})
 	if err != nil {
 		return err
 	}
@@ -159,9 +156,10 @@ type ReconcileResourceDistribution struct {
 
 //+kubebuilder:rbac:groups=apps.kruise.io,resources=resourcedistributions,verbs=get;list;watch;
 //+kubebuilder:rbac:groups=apps.kruise.io,resources=resourcedistributions/status,verbs=get;update;patch
-//+kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;
-//+kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;delete
-//+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;delete
+//+kubebuilder:rbac:groups=apps.kruise.io,resources=resourcedistributions/finalizers,verbs=update
+//+kubebuilder:rbac:groups="core",resources=namespaces,verbs=get;list;watch;
+//+kubebuilder:rbac:groups="core",resources=configmaps,verbs=get;list;watch;create;update;delete
+//+kubebuilder:rbac:groups="core",resources=secrets,verbs=get;list;watch;create;update;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -173,7 +171,7 @@ type ReconcileResourceDistribution struct {
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.6.4/pkg/reconcile
 func (r *ReconcileResourceDistribution) Reconcile(_ context.Context, req ctrl.Request) (ctrl.Result, error) {
-	klog.V(3).Infof("ResourceDistribution(%s) begin to reconcile", req.NamespacedName.Name)
+	klog.V(3).InfoS("ResourceDistribution begin to reconcile", "resourceDistribution", req)
 	// fetch resourcedistribution instance as distributor
 	distributor := &appsv1alpha1.ResourceDistribution{}
 	if err := r.Client.Get(context.TODO(), req.NamespacedName, distributor); err != nil {
@@ -193,13 +191,13 @@ func (r *ReconcileResourceDistribution) Reconcile(_ context.Context, req ctrl.Re
 func (r *ReconcileResourceDistribution) doReconcile(distributor *appsv1alpha1.ResourceDistribution) (ctrl.Result, error) {
 	resource, errs := utils.DeserializeResource(&distributor.Spec.Resource, field.NewPath("resource"))
 	if len(errs) != 0 || resource == nil {
-		klog.Errorf("DeserializeResource error: %v, name: %s", errs.ToAggregate(), distributor.Name)
+		klog.ErrorS(errs.ToAggregate(), "DeserializeResource error", "resourceDistribution", klog.KObj(distributor))
 		return reconcile.Result{}, nil // no need to retry
 	}
 
 	matchedNamespaces, unmatchedNamespaces, err := listNamespacesForDistributor(r.Client, &distributor.Spec.Targets)
 	if err != nil {
-		klog.Errorf("listNamespaceForDistributor error: %v, name: %s", err, distributor.Name)
+		klog.ErrorS(err, "Failed to list namespace for ResourceDistributor", "resourceDistribution", klog.KObj(distributor))
 		return reconcile.Result{}, err
 	}
 
@@ -242,7 +240,7 @@ func (r *ReconcileResourceDistribution) distributeResource(distributor *appsv1al
 		oldResource.SetGroupVersionKind(resource.GetObjectKind().GroupVersionKind())
 		getErr := r.Client.Get(context.TODO(), types.NamespacedName{Namespace: namespace, Name: resourceName}, oldResource)
 		if getErr != nil && !errors.IsNotFound(getErr) {
-			klog.Errorf("Error occurred when getting resource in namespace %s, err： %v, name: %s", namespace, getErr, distributor.Name)
+			klog.ErrorS(getErr, "Error occurred when getting resource in namespace", "namespace", namespace, "resourceDistribution", klog.KObj(distributor))
 			return &UnexpectedError{
 				err:         getErr,
 				namespace:   namespace,
@@ -254,20 +252,20 @@ func (r *ReconcileResourceDistribution) distributeResource(distributor *appsv1al
 		if getErr != nil && errors.IsNotFound(getErr) {
 			newResource := makeResourceObject(distributor, namespace, resource, resourceHashCode, nil)
 			if createErr := r.Client.Create(context.TODO(), newResource.(client.Object)); createErr != nil {
-				klog.Errorf("Error occurred when creating resource in namespace %s, err： %v, name: %s", namespace, createErr, distributor.Name)
+				klog.ErrorS(createErr, "Error occurred when creating resource in namespace", "namespace", namespace, "resourceDistribution", klog.KObj(distributor))
 				return &UnexpectedError{
 					err:         createErr,
 					namespace:   namespace,
 					conditionID: CreateConditionID,
 				}
 			}
-			klog.V(3).Infof("ResourceDistribution(%s) created (%s/%s) in namespaces %s", distributor.Name, resourceKind, resourceName, namespace)
+			klog.V(3).InfoS("ResourceDistribution created resource in namespace", "resourceDistribution", klog.KObj(distributor), "resourceKind", resourceKind, "resourceName", resourceName, "namespace", namespace)
 			return nil
 		}
 
 		// 3. check conflict
 		if !isControlledByDistributor(oldResource, distributor) {
-			klog.Errorf("Conflict with existing resource(%s/%s) in namespaces %s, name: %s", resourceKind, resourceName, namespace, distributor.Name)
+			klog.InfoS("Conflict with existing resource in namespace", "resourceKind", resourceKind, "resourceName", resourceName, "namespace", namespace, "resourceDistribution", klog.KObj(distributor))
 			return &UnexpectedError{
 				err:         fmt.Errorf("conflict with existing resources because of the same namespace, group, version, kind and name"),
 				namespace:   namespace,
@@ -279,14 +277,14 @@ func (r *ReconcileResourceDistribution) distributeResource(distributor *appsv1al
 		if needToUpdate(oldResource, utils.ConvertToUnstructured(resource)) {
 			newResource := makeResourceObject(distributor, namespace, resource, resourceHashCode, oldResource)
 			if updateErr := r.Client.Update(context.TODO(), newResource.(client.Object)); updateErr != nil {
-				klog.Errorf("Error occurred when updating resource in namespace %s, err： %v, name: %s", namespace, updateErr, distributor.Name)
+				klog.ErrorS(updateErr, "Error occurred when updating resource in namespace", "namespace", namespace, "resourceDistribution", klog.KObj(distributor))
 				return &UnexpectedError{
 					err:         updateErr,
 					namespace:   namespace,
 					conditionID: UpdateConditionID,
 				}
 			}
-			klog.V(3).Infof("ResourceDistribution(%s) updated (%s/%s) for namespaces %s", distributor.Name, resourceKind, resourceName, namespace)
+			klog.V(3).InfoS("ResourceDistribution updated for namespaces", "resourceDistribution", klog.KObj(distributor), "resourceKind", resourceKind, "resourceName", resourceName, "namespace", namespace)
 		}
 		return nil
 	})
@@ -311,7 +309,7 @@ func (r *ReconcileResourceDistribution) cleanResource(distributor *appsv1alpha1.
 			if errors.IsNotFound(getErr) {
 				return nil
 			}
-			klog.Errorf("Error occurred when getting resource in namespace %s, err： %v, name: %s", namespace, getErr, distributor.Name)
+			klog.ErrorS(getErr, "Error occurred when getting resource in namespace", "namespace", namespace, "resourceDistribution", klog.KObj(distributor))
 			return &UnexpectedError{
 				err:         getErr,
 				namespace:   namespace,
@@ -326,14 +324,14 @@ func (r *ReconcileResourceDistribution) cleanResource(distributor *appsv1alpha1.
 
 		// 3. else clean the resource
 		if deleteErr := r.Client.Delete(context.TODO(), oldResource); deleteErr != nil && !errors.IsNotFound(deleteErr) {
-			klog.Errorf("Error occurred when deleting resource in namespace %s from client, err： %v, name: %s", namespace, deleteErr, distributor.Name)
+			klog.ErrorS(deleteErr, "Error occurred when deleting resource in namespace from client", "namespace", namespace, "resourceDistribution", klog.KObj(distributor))
 			return &UnexpectedError{
 				err:         deleteErr,
 				namespace:   namespace,
 				conditionID: DeleteConditionID,
 			}
 		}
-		klog.V(3).Infof("ResourceDistribution(%s) deleted (%s/%s) in namespaces %s", distributor.Name, resourceKind, resourceName, namespace)
+		klog.V(3).InfoS("ResourceDistribution deleted in namespace", "resourceDistribution", klog.KObj(distributor), "resourceKind", resourceKind, "resourceName", resourceName, "namespace", namespace)
 		return nil
 	})
 }

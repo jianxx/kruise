@@ -20,13 +20,13 @@ package writer
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path"
 
+	"k8s.io/klog/v2"
+
 	"github.com/openkruise/kruise/pkg/webhook/util/generator"
 	"github.com/openkruise/kruise/pkg/webhook/util/writer/atomic"
-	"k8s.io/klog/v2"
 )
 
 const (
@@ -71,9 +71,7 @@ func NewFSCertWriter(ops FSCertWriterOptions) (CertWriter, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &fsCertWriter{
-		FSCertWriterOptions: &ops,
-	}, nil
+	return &fsCertWriter{FSCertWriterOptions: &ops}, nil
 }
 
 // EnsureCert provisions certificates for a webhookClientConfig by writing the certificates in the filesystem.
@@ -159,19 +157,19 @@ func (f *fsCertWriter) read() (*generator.Artifacts, error) {
 	if err := ensureExist(f.Path); err != nil {
 		return nil, err
 	}
-	caKeyBytes, err := ioutil.ReadFile(path.Join(f.Path, CAKeyName))
+	caKeyBytes, err := os.ReadFile(path.Join(f.Path, CAKeyName))
 	if err != nil {
 		return nil, err
 	}
-	caCertBytes, err := ioutil.ReadFile(path.Join(f.Path, CACertName))
+	caCertBytes, err := os.ReadFile(path.Join(f.Path, CACertName))
 	if err != nil {
 		return nil, err
 	}
-	certBytes, err := ioutil.ReadFile(path.Join(f.Path, ServerCertName))
+	certBytes, err := os.ReadFile(path.Join(f.Path, ServerCertName))
 	if err != nil {
 		return nil, err
 	}
-	keyBytes, err := ioutil.ReadFile(path.Join(f.Path, ServerKeyName))
+	keyBytes, err := os.ReadFile(path.Join(f.Path, ServerKeyName))
 	if err != nil {
 		return nil, err
 	}

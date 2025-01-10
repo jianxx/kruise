@@ -4,10 +4,6 @@ import (
 	"context"
 	"fmt"
 
-	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
-	clonesetcore "github.com/openkruise/kruise/pkg/controller/cloneset/core"
-	"github.com/openkruise/kruise/pkg/util"
-	"github.com/openkruise/kruise/pkg/webhook/util/convertor"
 	v1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apimachineryvalidation "k8s.io/apimachinery/pkg/api/validation"
@@ -20,6 +16,12 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/kubernetes/pkg/apis/core"
 	apivalidation "k8s.io/kubernetes/pkg/apis/core/validation"
+
+	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
+	clonesetcore "github.com/openkruise/kruise/pkg/controller/cloneset/core"
+	"github.com/openkruise/kruise/pkg/util"
+	webhookutil "github.com/openkruise/kruise/pkg/webhook/util"
+	"github.com/openkruise/kruise/pkg/webhook/util/convertor"
 )
 
 func (h *CloneSetCreateUpdateHandler) validateCloneSet(cloneSet, oldCloneSet *appsv1alpha1.CloneSet) field.ErrorList {
@@ -39,7 +41,7 @@ func (h *CloneSetCreateUpdateHandler) validateCloneSetSpec(spec, oldSpec *appsv1
 	if spec.Selector == nil {
 		allErrs = append(allErrs, field.Required(fldPath.Child("selector"), ""))
 	} else {
-		allErrs = append(allErrs, unversionedvalidation.ValidateLabelSelector(spec.Selector, fldPath.Child("selector"))...)
+		allErrs = append(allErrs, unversionedvalidation.ValidateLabelSelector(spec.Selector, unversionedvalidation.LabelSelectorValidationOptions{}, fldPath.Child("selector"))...)
 		if len(spec.Selector.MatchLabels)+len(spec.Selector.MatchExpressions) == 0 {
 			allErrs = append(allErrs, field.Invalid(fldPath.Child("selector"), spec.Selector, "empty selector is invalid for cloneset"))
 		}
@@ -73,7 +75,7 @@ func (h *CloneSetCreateUpdateHandler) validateCloneSetSpec(spec, oldSpec *appsv1
 				},
 			})
 		}
-		allErrs = append(allErrs, apivalidation.ValidatePodTemplateSpec(coreTemplate, fldPath.Child("template"), apivalidation.PodValidationOptions{AllowDownwardAPIHugePages: true, AllowMultipleHugePageResources: true})...)
+		allErrs = append(allErrs, apivalidation.ValidatePodTemplateSpec(coreTemplate, fldPath.Child("template"), webhookutil.DefaultPodValidationOptions)...)
 	}
 
 	if spec.Template.Spec.RestartPolicy != "" && spec.Template.Spec.RestartPolicy != v1.RestartPolicyAlways {
@@ -114,7 +116,7 @@ func (h *CloneSetCreateUpdateHandler) validateScaleStrategy(strategy, oldStrateg
 			allErrs = append(allErrs, field.Invalid(fldPath.Child("podsToDelete"), podName, fmt.Sprintf("find pod %s failed: %v", podName, err)))
 		} else if pod.DeletionTimestamp != nil {
 			allErrs = append(allErrs, field.Invalid(fldPath.Child("podsToDelete"), podName, fmt.Sprintf("find pod %s already terminating", podName)))
-		} else if owner := metav1.GetControllerOf(pod); owner.UID != metadata.UID {
+		} else if owner := metav1.GetControllerOf(pod); owner == nil || owner.UID != metadata.UID {
 			allErrs = append(allErrs, field.Invalid(fldPath.Child("podsToDelete"), podName, fmt.Sprintf("find pod %s owner is not this CloneSet", podName)))
 		}
 	}
@@ -137,7 +139,7 @@ func (h *CloneSetCreateUpdateHandler) validateUpdateStrategy(strategy *appsv1alp
 			appsv1alpha1.InPlaceOnlyCloneSetUpdateStrategyType)))
 	}
 
-	partition, err := intstrutil.GetValueFromIntOrPercent(strategy.Partition, replicas, true)
+	partition, err := util.GetScaledValueFromIntOrPercent(strategy.Partition, replicas, true)
 	if err != nil {
 		allErrs = append(allErrs, field.Invalid(fldPath.Child("partition"), strategy.Partition.String(),
 			fmt.Sprintf("failed getValueFromIntOrPercent for partition: %v", err)))
@@ -193,8 +195,9 @@ func (h *CloneSetCreateUpdateHandler) validateCloneSetUpdate(cloneSet, oldCloneS
 	clone.Spec.MinReadySeconds = oldCloneSet.Spec.MinReadySeconds
 	clone.Spec.Lifecycle = oldCloneSet.Spec.Lifecycle
 	clone.Spec.RevisionHistoryLimit = oldCloneSet.Spec.RevisionHistoryLimit
+	clone.Spec.VolumeClaimTemplates = oldCloneSet.Spec.VolumeClaimTemplates
 	if !apiequality.Semantic.DeepEqual(clone.Spec, oldCloneSet.Spec) {
-		allErrs = append(allErrs, field.Forbidden(field.NewPath("spec"), "updates to cloneset spec for fields other than 'replicas', 'template', 'lifecycle', 'scaleStrategy', 'updateStrategy', 'minReadySeconds' and 'revisionHistoryLimit' are forbidden"))
+		allErrs = append(allErrs, field.Forbidden(field.NewPath("spec"), "updates to cloneset spec for fields other than 'replicas', 'template', 'lifecycle', 'scaleStrategy', 'updateStrategy', 'minReadySeconds', 'volumeClaimTemplates' and 'revisionHistoryLimit' are forbidden"))
 	}
 
 	coreControl := clonesetcore.New(cloneSet)

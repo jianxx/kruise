@@ -24,11 +24,10 @@ import (
 	"sync"
 	"testing"
 
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+
 	"github.com/onsi/gomega"
-	"github.com/openkruise/kruise/apis"
-	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
-	"github.com/openkruise/kruise/pkg/util"
-	"github.com/openkruise/kruise/pkg/util/fieldindex"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -38,6 +37,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+
+	"github.com/openkruise/kruise/apis"
+	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
+	utilclient "github.com/openkruise/kruise/pkg/util/client"
+	"github.com/openkruise/kruise/pkg/util/fieldindex"
 )
 
 var c client.Client
@@ -48,7 +52,7 @@ func TestMain(m *testing.M) {
 	t := &envtest.Environment{
 		CRDDirectoryPaths: []string{filepath.Join("..", "..", "..", "config", "crd", "bases")},
 	}
-	apis.AddToScheme(clientgoscheme.Scheme)
+	utilruntime.Must(apis.AddToScheme(clientgoscheme.Scheme))
 
 	var err error
 	if cfg, err = t.Start(); err != nil {
@@ -129,25 +133,33 @@ var (
 		{
 			ObjectMeta: metav1.ObjectMeta{Name: "job2"},
 			Spec: appsv1alpha1.ImagePullJobSpec{
-				Selector: &appsv1alpha1.ImagePullJobNodeSelector{Names: []string{"node2", "node4"}},
+				ImagePullJobTemplate: appsv1alpha1.ImagePullJobTemplate{
+					Selector: &appsv1alpha1.ImagePullJobNodeSelector{Names: []string{"node2", "node4"}},
+				},
 			},
 		},
 		{
 			ObjectMeta: metav1.ObjectMeta{Name: "job3"},
 			Spec: appsv1alpha1.ImagePullJobSpec{
-				Selector: &appsv1alpha1.ImagePullJobNodeSelector{LabelSelector: metav1.LabelSelector{MatchLabels: map[string]string{"arch": "arm64"}}},
+				ImagePullJobTemplate: appsv1alpha1.ImagePullJobTemplate{
+					Selector: &appsv1alpha1.ImagePullJobNodeSelector{LabelSelector: metav1.LabelSelector{MatchLabels: map[string]string{"arch": "arm64"}}},
+				},
 			},
 		},
 		{
 			ObjectMeta: metav1.ObjectMeta{Name: "job4"},
 			Spec: appsv1alpha1.ImagePullJobSpec{
-				Selector: &appsv1alpha1.ImagePullJobNodeSelector{LabelSelector: metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{{Key: "arch", Operator: metav1.LabelSelectorOpDoesNotExist}}}},
+				ImagePullJobTemplate: appsv1alpha1.ImagePullJobTemplate{
+					Selector: &appsv1alpha1.ImagePullJobNodeSelector{LabelSelector: metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{{Key: "arch", Operator: metav1.LabelSelectorOpDoesNotExist}}}},
+				},
 			},
 		},
 		{
 			ObjectMeta: metav1.ObjectMeta{Name: "job5"},
 			Spec: appsv1alpha1.ImagePullJobSpec{
-				PodSelector: &appsv1alpha1.ImagePullJobPodSelector{LabelSelector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "foo"}}},
+				ImagePullJobTemplate: appsv1alpha1.ImagePullJobTemplate{
+					PodSelector: &appsv1alpha1.ImagePullJobPodSelector{LabelSelector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "foo"}}},
+				},
 			},
 		},
 		{
@@ -161,10 +173,10 @@ func TestAll(t *testing.T) {
 	g := gomega.NewGomegaWithT(t)
 
 	var err error
-	mgr, err := manager.New(cfg, manager.Options{MetricsBindAddress: "0"})
+	mgr, err := manager.New(cfg, manager.Options{Metrics: metricsserver.Options{BindAddress: "0"}})
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 	_ = fieldindex.RegisterFieldIndexes(mgr.GetCache())
-	c = util.NewClientFromManager(mgr, "test-nodeimage-utils")
+	c = utilclient.NewClientFromManager(mgr, "test-nodeimage-utils")
 
 	for _, o := range initialNodeImages {
 		if err = c.Create(context.TODO(), o); err != nil {

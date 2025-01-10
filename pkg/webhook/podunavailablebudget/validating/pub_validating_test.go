@@ -21,17 +21,17 @@ import (
 	"testing"
 
 	policyv1alpha1 "github.com/openkruise/kruise/apis/policy/v1alpha1"
-
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
 func init() {
 	scheme = runtime.NewScheme()
-	_ = policyv1alpha1.AddToScheme(scheme)
+	utilruntime.Must(policyv1alpha1.AddToScheme(scheme))
 }
 
 var (
@@ -43,8 +43,9 @@ var (
 			Kind:       "PodUnavailableBudget",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "default",
-			Name:      "pub-test",
+			Namespace:   "default",
+			Name:        "pub-test",
+			Annotations: map[string]string{},
 		},
 		Spec: policyv1alpha1.PodUnavailableBudgetSpec{
 			Selector: &metav1.LabelSelector{
@@ -135,9 +136,53 @@ func TestValidatingPub(t *testing.T) {
 			},
 			expectErrList: 1,
 		},
+		{
+			name: "invalid pub feature-gate annotation",
+			pub: func() *policyv1alpha1.PodUnavailableBudget {
+				pub := pubDemo.DeepCopy()
+				pub.Spec.Selector = nil
+				pub.Spec.MinAvailable = nil
+				pub.Annotations[policyv1alpha1.PubProtectOperationAnnotation] = "xxxxx"
+				return pub
+			},
+			expectErrList: 1,
+		},
+		{
+			name: "valid pub feature-gate annotation",
+			pub: func() *policyv1alpha1.PodUnavailableBudget {
+				pub := pubDemo.DeepCopy()
+				pub.Spec.Selector = nil
+				pub.Spec.MinAvailable = nil
+				pub.Annotations[policyv1alpha1.PubProtectOperationAnnotation] = string(policyv1alpha1.PubEvictOperation + "," + policyv1alpha1.PubDeleteOperation)
+				return pub
+			},
+			expectErrList: 0,
+		},
+		{
+			name: "invalid pub feature-gate annotation",
+			pub: func() *policyv1alpha1.PodUnavailableBudget {
+				pub := pubDemo.DeepCopy()
+				pub.Spec.Selector = nil
+				pub.Spec.MinAvailable = nil
+				pub.Annotations[policyv1alpha1.PubProtectTotalReplicasAnnotation] = "%%"
+				return pub
+			},
+			expectErrList: 1,
+		},
+		{
+			name: "valid pub feature-gate annotation",
+			pub: func() *policyv1alpha1.PodUnavailableBudget {
+				pub := pubDemo.DeepCopy()
+				pub.Spec.Selector = nil
+				pub.Spec.MinAvailable = nil
+				pub.Annotations[policyv1alpha1.PubProtectTotalReplicasAnnotation] = "1000"
+				return pub
+			},
+			expectErrList: 0,
+		},
 	}
 
-	decoder, _ := admission.NewDecoder(scheme)
+	decoder := admission.NewDecoder(scheme)
 	client := fake.NewClientBuilder().WithScheme(scheme).Build()
 	pubHandler := PodUnavailableBudgetCreateUpdateHandler{
 		Client:  client,
@@ -306,7 +351,7 @@ func TestPubConflictWithOthers(t *testing.T) {
 
 	for _, cs := range cases {
 		t.Run(cs.name, func(t *testing.T) {
-			decoder, _ := admission.NewDecoder(scheme)
+			decoder := admission.NewDecoder(scheme)
 			client := fake.NewClientBuilder().WithScheme(scheme).Build()
 			for _, pub := range cs.otherPubs() {
 				client.Create(context.TODO(), pub)
@@ -390,7 +435,7 @@ func TestValidatingUpdatePub(t *testing.T) {
 		},
 	}
 
-	decoder, _ := admission.NewDecoder(scheme)
+	decoder := admission.NewDecoder(scheme)
 	client := fake.NewClientBuilder().WithScheme(scheme).Build()
 	pubHandler := PodUnavailableBudgetCreateUpdateHandler{
 		Client:  client,

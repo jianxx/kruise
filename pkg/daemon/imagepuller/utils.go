@@ -20,7 +20,6 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
-	"reflect"
 	"time"
 
 	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
@@ -46,7 +45,7 @@ func logNewImages(oldObj, newObj *appsv1alpha1.NodeImage) {
 		for _, tagSpec := range imageSpec.Tags {
 			fullName := fmt.Sprintf("%v:%v", image, tagSpec.Tag)
 			if _, ok := oldImages[fullName]; !ok {
-				klog.V(2).Infof("Received new image %v", fullName)
+				klog.V(2).InfoS("Received new image", "fullName", fullName)
 			}
 		}
 	}
@@ -110,11 +109,11 @@ func (su *statusUpdater) updateStatus(nodeImage *appsv1alpha1.NodeImage, newStat
 	// IMPORTANT!!! Make sure rate limiter is working!
 	if !su.rateLimiter.Allow() {
 		msg := fmt.Sprintf("Updating status is limited qps=%v burst=%v", statusUpdateQPS, statusUpdateBurst)
-		klog.V(3).Infof(msg)
+		klog.V(3).Info(msg)
 		return true, nil
 	}
 
-	klog.V(5).Infof("Updating status: %v", util.DumpJSON(newStatus))
+	klog.V(5).InfoS("Updating status", "status", util.DumpJSON(newStatus))
 	newNodeImage := nodeImage.DeepCopy()
 	newNodeImage.Status = *newStatus
 
@@ -124,9 +123,4 @@ func (su *statusUpdater) updateStatus(nodeImage *appsv1alpha1.NodeImage, newStat
 	}
 	su.previousTimestamp = time.Now()
 	return false, err
-}
-
-func (su *statusUpdater) statusChanged(newStatus *appsv1alpha1.NodeImageStatus) bool {
-	// Can not use imagePullNode.Status to compare because of time accuracy
-	return !reflect.DeepEqual(su.previousStatus, newStatus)
 }

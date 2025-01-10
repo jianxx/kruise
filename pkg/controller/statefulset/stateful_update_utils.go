@@ -17,9 +17,11 @@ limitations under the License.
 package statefulset
 
 import (
-	appsv1beta1 "github.com/openkruise/kruise/apis/apps/v1beta1"
-	"github.com/openkruise/kruise/pkg/util/updatesort"
 	v1 "k8s.io/api/core/v1"
+
+	appsv1beta1 "github.com/openkruise/kruise/apis/apps/v1beta1"
+	"github.com/openkruise/kruise/pkg/util/revision"
+	"github.com/openkruise/kruise/pkg/util/updatesort"
 )
 
 func sortPodsToUpdate(rollingUpdateStrategy *appsv1beta1.RollingUpdateStatefulSetStrategy, updateRevision string, totalReplicas int32, replicas []*v1.Pod) []int {
@@ -28,9 +30,14 @@ func sortPodsToUpdate(rollingUpdateStrategy *appsv1beta1.RollingUpdateStatefulSe
 		updateMin = int(*rollingUpdateStrategy.Partition)
 	}
 
+	maxUpdate := int(totalReplicas) - updateMin
+	if maxUpdate <= 0 {
+		return []int{}
+	}
+
 	if rollingUpdateStrategy == nil || rollingUpdateStrategy.UnorderedUpdate == nil {
 		var indexes []int
-		for target := len(replicas) - 1; target >= updateMin; target-- {
+		for target := len(replicas) - 1; target >= updateMin && len(indexes) < maxUpdate; target-- {
 			if replicas[target] == nil {
 				continue
 			}
@@ -40,10 +47,6 @@ func sortPodsToUpdate(rollingUpdateStrategy *appsv1beta1.RollingUpdateStatefulSe
 	}
 
 	priorityStrategy := rollingUpdateStrategy.UnorderedUpdate.PriorityStrategy
-	maxUpdate := int(totalReplicas) - updateMin
-	if maxUpdate <= 0 {
-		return []int{}
-	}
 
 	var updatedIdxs []int
 	var waitUpdateIdxs []int
@@ -53,7 +56,7 @@ func sortPodsToUpdate(rollingUpdateStrategy *appsv1beta1.RollingUpdateStatefulSe
 		}
 		if isTerminating(replicas[target]) {
 			updatedIdxs = append(updatedIdxs, target)
-		} else if getPodRevision(replicas[target]) == updateRevision {
+		} else if revision.IsPodUpdate(replicas[target], updateRevision) {
 			updatedIdxs = append(updatedIdxs, target)
 		} else {
 			waitUpdateIdxs = append(waitUpdateIdxs, target)

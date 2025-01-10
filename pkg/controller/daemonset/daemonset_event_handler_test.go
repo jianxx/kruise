@@ -21,18 +21,22 @@ import (
 	"testing"
 	"time"
 
-	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/workqueue"
+	"k8s.io/klog/v2"
+	kubecontroller "k8s.io/kubernetes/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+
+	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
 )
 
-func newTestPodEventHandler(reader client.Reader) *podEventHandler {
+func newTestPodEventHandler(reader client.Reader, expectations kubecontroller.ControllerExpectationsInterface) *podEventHandler {
 	return &podEventHandler{
-		Reader: reader,
+		Reader:       reader,
+		expectations: expectations,
 	}
 }
 
@@ -63,7 +67,7 @@ func TestEnqueueRequestForPodCreate(t *testing.T) {
 			dss: []*appsv1alpha1.DaemonSet{
 				{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:      "cs01",
+						Name:      "ds01",
 						Namespace: "default",
 					},
 					Spec: appsv1alpha1.DaemonSetSpec{
@@ -79,7 +83,7 @@ func TestEnqueueRequestForPodCreate(t *testing.T) {
 				},
 				{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:      "cs02",
+						Name:      "ds02",
 						Namespace: "default",
 					},
 					Spec: appsv1alpha1.DaemonSetSpec{
@@ -102,7 +106,7 @@ func TestEnqueueRequestForPodCreate(t *testing.T) {
 			dss: []*appsv1alpha1.DaemonSet{
 				{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:      "cs01",
+						Name:      "ds01",
 						Namespace: "default",
 						UID:       "001",
 					},
@@ -119,7 +123,7 @@ func TestEnqueueRequestForPodCreate(t *testing.T) {
 				},
 				{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:      "cs02",
+						Name:      "ds02",
 						Namespace: "default",
 						UID:       "002",
 					},
@@ -158,33 +162,34 @@ func TestEnqueueRequestForPodCreate(t *testing.T) {
 			expectedQueueLen:              1,
 		},
 	}
-
+	logger := klog.FromContext(context.TODO())
 	for _, testCase := range cases {
 		fakeClient := fake.NewClientBuilder().Build()
 		for _, ds := range testCase.dss {
 			fakeClient.Create(context.TODO(), ds)
 		}
 
-		enqueueHandler := newTestPodEventHandler(fakeClient)
+		exp := kubecontroller.NewControllerExpectations()
+		enqueueHandler := newTestPodEventHandler(fakeClient, exp)
 		q := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "test-queue")
 
 		for i := 0; i < len(testCase.alterExpectationCreationsAdds); i++ {
-			expectations.ExpectCreations(testCase.alterExpectationCreationsKey, 1)
+			exp.ExpectCreations(logger, testCase.alterExpectationCreationsKey, 1)
 		}
 
 		if testCase.alterExpectationCreationsKey != "" {
-			if ok := expectations.SatisfiedExpectations(testCase.alterExpectationCreationsKey); ok {
+			if ok := exp.SatisfiedExpectations(logger, testCase.alterExpectationCreationsKey); ok {
 				t.Fatalf("%s before execute, should not be satisfied", testCase.name)
 			}
 		}
 
-		enqueueHandler.Create(testCase.e, q)
+		enqueueHandler.Create(context.TODO(), testCase.e, q)
 		if q.Len() != testCase.expectedQueueLen {
 			t.Fatalf("%s failed, expected queue len %d, got queue len %d", testCase.name, testCase.expectedQueueLen, q.Len())
 		}
 
 		if testCase.alterExpectationCreationsKey != "" {
-			if ok := expectations.SatisfiedExpectations(testCase.alterExpectationCreationsKey); !ok {
+			if ok := exp.SatisfiedExpectations(logger, testCase.alterExpectationCreationsKey); !ok {
 				t.Fatalf("%s after execute, should be satisfied", testCase.name)
 			}
 		}
@@ -376,7 +381,7 @@ func TestEnqueueRequestForPodUpdate(t *testing.T) {
 				},
 				{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:      "cs02",
+						Name:      "ds02",
 						Namespace: "default",
 						UID:       "002",
 					},
@@ -433,7 +438,7 @@ func TestEnqueueRequestForPodUpdate(t *testing.T) {
 			dss: []*appsv1alpha1.DaemonSet{
 				{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:      "cs01",
+						Name:      "ds01",
 						Namespace: "default",
 						UID:       "001",
 					},
@@ -450,7 +455,7 @@ func TestEnqueueRequestForPodUpdate(t *testing.T) {
 				},
 				{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:      "cs02",
+						Name:      "ds02",
 						Namespace: "default",
 						UID:       "002",
 					},
@@ -507,7 +512,7 @@ func TestEnqueueRequestForPodUpdate(t *testing.T) {
 			dss: []*appsv1alpha1.DaemonSet{
 				{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:      "cs01",
+						Name:      "ds01",
 						Namespace: "default",
 						UID:       "001",
 					},
@@ -524,7 +529,7 @@ func TestEnqueueRequestForPodUpdate(t *testing.T) {
 				},
 				{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:      "cs02",
+						Name:      "ds02",
 						Namespace: "default",
 						UID:       "002",
 					},
@@ -563,7 +568,7 @@ func TestEnqueueRequestForPodUpdate(t *testing.T) {
 			dss: []*appsv1alpha1.DaemonSet{
 				{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:      "cs01",
+						Name:      "ds01",
 						Namespace: "default",
 						UID:       "001",
 					},
@@ -580,7 +585,7 @@ func TestEnqueueRequestForPodUpdate(t *testing.T) {
 				},
 				{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:      "cs02",
+						Name:      "ds02",
 						Namespace: "default",
 						UID:       "002",
 					},
@@ -597,7 +602,7 @@ func TestEnqueueRequestForPodUpdate(t *testing.T) {
 				},
 				{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:      "cs03",
+						Name:      "ds03",
 						Namespace: "default",
 						UID:       "003",
 					},
@@ -647,10 +652,11 @@ func TestEnqueueRequestForPodUpdate(t *testing.T) {
 		for _, ds := range testCase.dss {
 			fakeClient.Create(context.TODO(), ds)
 		}
-		enqueueHandler := newTestPodEventHandler(fakeClient)
+		exp := kubecontroller.NewControllerExpectations()
+		enqueueHandler := newTestPodEventHandler(fakeClient, exp)
 		q := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "test-queue")
 
-		enqueueHandler.Update(testCase.e, q)
+		enqueueHandler.Update(context.TODO(), testCase.e, q)
 		time.Sleep(time.Millisecond * 10)
 		if q.Len() != testCase.expectedQueueLen {
 			t.Fatalf("%s failed, expected queue len %d, got queue len %d", testCase.name, testCase.expectedQueueLen, q.Len())
@@ -672,7 +678,7 @@ func TestEnqueueRequestForNodeCreate(t *testing.T) {
 		expectedQueueLen int
 	}{
 		{
-			name: "add one ummatched node",
+			name: "add one unmatched node",
 			dss: []*appsv1alpha1.DaemonSet{
 				{
 					ObjectMeta: metav1.ObjectMeta{
@@ -692,7 +698,7 @@ func TestEnqueueRequestForNodeCreate(t *testing.T) {
 				},
 				{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:      "cs02",
+						Name:      "ds02",
 						Namespace: "default",
 					},
 					Spec: appsv1alpha1.DaemonSetSpec{
@@ -743,7 +749,7 @@ func TestEnqueueRequestForNodeCreate(t *testing.T) {
 				},
 				{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:      "cs02",
+						Name:      "ds02",
 						Namespace: "default",
 					},
 					Spec: appsv1alpha1.DaemonSetSpec{
@@ -772,7 +778,7 @@ func TestEnqueueRequestForNodeCreate(t *testing.T) {
 		enqueueHandler := newTestNodeEventHandler(fakeClient)
 		q := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "test-queue")
 
-		enqueueHandler.Create(testCase.e, q)
+		enqueueHandler.Create(context.TODO(), testCase.e, q)
 		if q.Len() != testCase.expectedQueueLen {
 			t.Fatalf("%s failed, expected queue len %d, got queue len %d", testCase.name, testCase.expectedQueueLen, q.Len())
 		}
@@ -787,7 +793,7 @@ func TestEnqueueRequestForNodeUpdate(t *testing.T) {
 		expectedQueueLen int
 	}{
 		{
-			name: "ShouldIgnoreNodeUpdate",
+			name: "shouldIgnoreNodeUpdate",
 			e: event.UpdateEvent{
 				ObjectOld: &v1.Node{
 					ObjectMeta: metav1.ObjectMeta{
@@ -897,7 +903,7 @@ func TestEnqueueRequestForNodeUpdate(t *testing.T) {
 		enqueueHandler := newTestNodeEventHandler(fakeClient)
 		q := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "test-queue")
 
-		enqueueHandler.Update(testCase.e, q)
+		enqueueHandler.Update(context.TODO(), testCase.e, q)
 		if q.Len() != testCase.expectedQueueLen {
 			t.Fatalf("%s failed, expected queue len %d, got queue len %d", testCase.name, testCase.expectedQueueLen, q.Len())
 		}

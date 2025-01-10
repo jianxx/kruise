@@ -29,9 +29,17 @@ type DaemonSetExpansion interface{}
 
 type EphemeralJobExpansion interface{}
 
+type ImageListPullJobExpansion interface{}
+
 type ImagePullJobExpansion interface{}
 
 type NodeImageExpansion interface{}
+
+type NodePodProbeExpansion interface{}
+
+type PersistentPodStateExpansion interface{}
+
+type PodProbeMarkerExpansion interface{}
 
 type ResourceDistributionExpansion interface{}
 

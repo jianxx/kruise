@@ -5,18 +5,25 @@ import (
 	"fmt"
 	"time"
 
-	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
-	kruiseclientset "github.com/openkruise/kruise/pkg/client/clientset/versioned"
-	"github.com/openkruise/kruise/test/e2e/framework"
-
 	"github.com/onsi/ginkgo"
 	"github.com/onsi/gomega"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
+	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
+	daemonutil "k8s.io/kubernetes/pkg/controller/daemon/util"
+
+	appspub "github.com/openkruise/kruise/apis/apps/pub"
+	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
+	kruiseclientset "github.com/openkruise/kruise/pkg/client/clientset/versioned"
+	"github.com/openkruise/kruise/pkg/util/lifecycle"
+	"github.com/openkruise/kruise/test/e2e/framework"
 )
 
 var _ = SIGDescribe("DaemonSet", func() {
@@ -40,7 +47,7 @@ var _ = SIGDescribe("DaemonSet", func() {
 			if ginkgo.CurrentGinkgoTestDescription().Failed {
 				framework.DumpDebugInfo(c, ns)
 			}
-			framework.Logf("Deleting DaemonSet %s.%s in cluster", ns, dsName)
+			framework.Logf("Deleting DaemonSet %s/%s in cluster", ns, dsName)
 			tester.DeleteDaemonSet(ns, dsName)
 		})
 
@@ -51,7 +58,6 @@ var _ = SIGDescribe("DaemonSet", func() {
 		*/
 		framework.ConformanceIt("should run and stop simple daemon", func() {
 			label := map[string]string{framework.DaemonSetNameLabel: dsName}
-
 			ginkgo.By(fmt.Sprintf("Creating simple DaemonSet %q", dsName))
 			ds, err := tester.CreateDaemonSet(tester.NewDaemonSet(dsName, label, WebserverImage, appsv1alpha1.DaemonSetUpdateStrategy{}))
 			gomega.Expect(err).NotTo(gomega.HaveOccurred())
@@ -304,6 +310,195 @@ var _ = SIGDescribe("DaemonSet", func() {
 				ginkgo.By(fmt.Sprintf("No pod recreate during updating, expect %v", tc.expectRecreate))
 				gomega.Expect(tester.CheckPodHasNotRecreate(oldPodList.Items, newPodList.Items)).Should(gomega.Equal(tc.expectRecreate))
 			}
+		})
+
+		framework.ConformanceIt("should upgrade one by one on steps if there is pre-delete hook", func() {
+			label := map[string]string{framework.DaemonSetNameLabel: dsName}
+			hookKey := "my-pre-delete"
+
+			ginkgo.By(fmt.Sprintf("Creating DaemonSet %q with pre-delete hook", dsName))
+			maxUnavailable := intstr.IntOrString{IntVal: int32(1)}
+			ads := tester.NewDaemonSet(dsName, label, WebserverImage, appsv1alpha1.DaemonSetUpdateStrategy{
+				Type: appsv1alpha1.RollingUpdateDaemonSetStrategyType,
+				RollingUpdate: &appsv1alpha1.RollingUpdateDaemonSet{
+					Type:           appsv1alpha1.InplaceRollingUpdateType,
+					MaxUnavailable: &maxUnavailable,
+				},
+			})
+			ads.Spec.Lifecycle = &appspub.Lifecycle{PreDelete: &appspub.LifecycleHook{LabelsHandler: map[string]string{hookKey: "true"}}}
+			ads.Spec.Template.Labels = map[string]string{framework.DaemonSetNameLabel: dsName, hookKey: "true"}
+			ads.Spec.Template.Spec.Containers[0].Resources = v1.ResourceRequirements{
+				Requests: v1.ResourceList{
+					v1.ResourceCPU: resource.MustParse("100m"),
+				},
+			}
+			ds, err := tester.CreateDaemonSet(ads)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+			ginkgo.By("Check that daemon pods launch on every node of the cluster")
+			err = wait.PollImmediate(framework.DaemonSetRetryPeriod, framework.DaemonSetRetryTimeout, tester.CheckRunningOnAllNodes(ds))
+			gomega.Expect(err).NotTo(gomega.HaveOccurred(), "error waiting for daemon pod to start")
+
+			err = tester.CheckDaemonStatus(dsName)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+			oldPodList, err := tester.ListDaemonPods(label)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+			ginkgo.By("Update daemonset resources")
+			err = tester.UpdateDaemonSet(ds.Name, func(ads *appsv1alpha1.DaemonSet) {
+				ads.Spec.Template.Spec.Containers[0].Resources = v1.ResourceRequirements{
+					Requests: v1.ResourceList{
+						v1.ResourceCPU: resource.MustParse("120m"),
+					},
+				}
+				// when enable InPlaceWorkloadVerticalScaling feature, just resize request will not delete pod
+				ads.Spec.Template.Spec.Containers[0].Env = append(ads.Spec.Template.Spec.Containers[0].Env, v1.EnvVar{Name: "test", Value: "test"})
+			})
+			gomega.Expect(err).NotTo(gomega.HaveOccurred(), "error to update daemon")
+
+			var newHash string
+			gomega.Eventually(func() int64 {
+				ads, err = tester.GetDaemonSet(dsName)
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+				newHash = ads.Status.DaemonSetHash
+				return ads.Status.ObservedGeneration
+			}, time.Second*30, time.Second*3).Should(gomega.Equal(int64(2)))
+
+			ginkgo.By("There should be one pod with PreparingDelete and no pods been deleted")
+			var preDeletingPod *v1.Pod
+			var podList *v1.PodList
+			gomega.Eventually(func() int {
+				podList, err = tester.ListDaemonPods(label)
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+				var preDeletingCount int
+				for i := range podList.Items {
+					pod := &podList.Items[i]
+					if lifecycle.GetPodLifecycleState(pod) == appspub.LifecycleStatePreparingDelete {
+						preDeletingCount++
+						preDeletingPod = pod
+					}
+				}
+				return preDeletingCount
+			}, time.Second*30, time.Second*3).Should(gomega.Equal(1))
+
+			gomega.Expect(tester.SortPodNames(podList)).To(gomega.Equal(tester.SortPodNames(oldPodList)))
+
+			ginkgo.By("Remove the hook label and wait it to be recreated")
+			patch := fmt.Sprintf(`{"metadata":{"labels":{"%s":null}}}`, hookKey)
+			_, err = tester.PatchPod(preDeletingPod.Name, types.StrategicMergePatchType, []byte(patch))
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+			var getErr error
+			gomega.Eventually(func() bool {
+				_, getErr = tester.GetPod(preDeletingPod.Name)
+				return errors.IsNotFound(getErr)
+			}, time.Second*60, time.Second).Should(gomega.Equal(true), fmt.Sprintf("get error %v", getErr))
+
+			gomega.Eventually(func() int {
+				podList, err = tester.ListDaemonPods(label)
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+				var newVersionCount int
+				for i := range podList.Items {
+					pod := &podList.Items[i]
+					if daemonutil.IsPodUpdated(pod, newHash, nil) {
+						newVersionCount++
+					} else if lifecycle.GetPodLifecycleState(pod) == appspub.LifecycleStatePreparingDelete {
+						preDeletingPod = pod
+					}
+				}
+				return newVersionCount
+			}, time.Second*60, time.Second).Should(gomega.Equal(1))
+
+		})
+
+		framework.ConformanceIt("should successfully surging update daemonset with minReadySeconds", func() {
+			label := map[string]string{framework.DaemonSetNameLabel: dsName}
+
+			ginkgo.By(fmt.Sprintf("Creating DaemonSet %q", dsName))
+			maxSurge := intstr.FromString("100%")
+			maxUnavailable := intstr.FromInt(0)
+			ds := tester.NewDaemonSet(dsName, label, WebserverImage, appsv1alpha1.DaemonSetUpdateStrategy{
+				Type: appsv1alpha1.RollingUpdateDaemonSetStrategyType,
+				RollingUpdate: &appsv1alpha1.RollingUpdateDaemonSet{
+					MaxSurge:       &maxSurge,
+					MaxUnavailable: &maxUnavailable,
+				},
+			})
+			ds.Spec.MinReadySeconds = 10
+			ds, err := tester.CreateDaemonSet(ds)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+			ginkgo.By("Check that daemon pods launch on every node of the cluster.")
+			err = wait.PollImmediate(framework.DaemonSetRetryPeriod, framework.DaemonSetRetryTimeout, tester.CheckRunningOnAllNodes(ds))
+
+			gomega.Expect(err).NotTo(gomega.HaveOccurred(), "error waiting for daemon pod to start")
+			err = tester.CheckDaemonStatus(dsName)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+			ds, err = tester.GetDaemonSet(dsName)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+			ginkgo.By("Get all old daemon pods on nodes")
+			oldNodeToDaemonPods, err := tester.GetNodesToDaemonPods(label)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			gomega.Expect(oldNodeToDaemonPods).To(gomega.HaveLen(int(ds.Status.DesiredNumberScheduled)))
+
+			nodeNameList := sets.NewString()
+			for nodeName, pods := range oldNodeToDaemonPods {
+				nodeNameList.Insert(nodeName)
+				gomega.Expect(pods).To(gomega.HaveLen(1))
+				gomega.Expect(podutil.IsPodReady(pods[0])).To(gomega.BeTrue())
+			}
+
+			//change pods container image
+			err = tester.UpdateDaemonSet(ds.Name, func(ds *appsv1alpha1.DaemonSet) {
+				ds.Spec.Template.Spec.Containers[0].Image = NewWebserverImage
+			})
+			gomega.Expect(err).NotTo(gomega.HaveOccurred(), "error to update daemon")
+
+			ginkgo.By("Check all surging Pods created")
+			err = wait.PollImmediate(time.Second, time.Minute, func() (done bool, err error) {
+				nodeToDaemonPods, err := tester.GetNodesToDaemonPods(label)
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+				gomega.Expect(nodeToDaemonPods).To(gomega.HaveLen(int(ds.Status.DesiredNumberScheduled)))
+
+				for _, nodeName := range nodeNameList.List() {
+					pods := nodeToDaemonPods[nodeName]
+					if len(pods) < 2 {
+						continue
+					}
+
+					for _, pod := range pods {
+						if pod.Name == oldNodeToDaemonPods[nodeName][0].Name {
+							gomega.Expect(pod.DeletionTimestamp).To(gomega.BeNil())
+						}
+					}
+					nodeNameList.Delete(nodeName)
+				}
+				return nodeNameList.Len() == 0, nil
+			})
+
+			ginkgo.By("Check all old Pods deleted")
+			err = wait.PollImmediate(time.Second, time.Minute, func() (done bool, err error) {
+				nodeToDaemonPods, err := tester.GetNodesToDaemonPods(label)
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+				gomega.Expect(nodeToDaemonPods).To(gomega.HaveLen(int(ds.Status.DesiredNumberScheduled)))
+
+				finished := true
+				for nodeName, pods := range nodeToDaemonPods {
+					if len(pods) != 1 {
+						finished = false
+						continue
+					}
+
+					gomega.Expect(pods[0].Name).NotTo(gomega.Equal(oldNodeToDaemonPods[nodeName][0].Name))
+					gomega.Expect(podutil.IsPodReady(pods[0])).To(gomega.BeTrue())
+					c := podutil.GetPodReadyCondition(pods[0].Status)
+					gomega.Expect(int32(time.Since(c.LastTransitionTime.Time) / time.Second)).To(gomega.BeNumerically(">", ds.Spec.MinReadySeconds))
+				}
+				return finished, nil
+			})
 		})
 	})
 })

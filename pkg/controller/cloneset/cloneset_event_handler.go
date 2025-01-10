@@ -20,10 +20,8 @@ import (
 	"context"
 	"reflect"
 	"strings"
+	"time"
 
-	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
-	clonesetutils "github.com/openkruise/kruise/pkg/controller/cloneset/utils"
-	"github.com/openkruise/kruise/pkg/util/expectations"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -35,6 +33,19 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
+	clonesetcore "github.com/openkruise/kruise/pkg/controller/cloneset/core"
+	clonesetutils "github.com/openkruise/kruise/pkg/controller/cloneset/utils"
+	"github.com/openkruise/kruise/pkg/features"
+	"github.com/openkruise/kruise/pkg/util/expectations"
+	utilfeature "github.com/openkruise/kruise/pkg/util/feature"
+)
+
+var (
+	// initialingRateLimiter calculates the delay duration for existing Pods
+	// triggered Create event when the Informer cache has just synced.
+	initialingRateLimiter = workqueue.NewItemExponentialFailureRateLimiter(3*time.Second, 30*time.Second)
 )
 
 type podEventHandler struct {
@@ -43,12 +54,12 @@ type podEventHandler struct {
 
 var _ handler.EventHandler = &podEventHandler{}
 
-func (e *podEventHandler) Create(evt event.CreateEvent, q workqueue.RateLimitingInterface) {
+func (e *podEventHandler) Create(ctx context.Context, evt event.CreateEvent, q workqueue.RateLimitingInterface) {
 	pod := evt.Object.(*v1.Pod)
 	if pod.DeletionTimestamp != nil {
 		// on a restart of the controller manager, it's possible a new pod shows up in a state that
 		// is already pending deletion. Prevent the pod from being a creation observation.
-		e.Delete(event.DeleteEvent{Object: evt.Object}, q)
+		e.Delete(ctx, event.DeleteEvent{Object: evt.Object}, q)
 		return
 	}
 
@@ -58,9 +69,19 @@ func (e *podEventHandler) Create(evt event.CreateEvent, q workqueue.RateLimiting
 		if req == nil {
 			return
 		}
-		klog.V(4).Infof("Pod %s/%s created, owner: %s", pod.Namespace, pod.Name, req.Name)
+		klog.V(4).InfoS("Pod created", "pod", klog.KObj(pod), "owner", req)
+
+		isSatisfied, _, _ := clonesetutils.ScaleExpectations.SatisfiedExpectations(req.String())
 		clonesetutils.ScaleExpectations.ObserveScale(req.String(), expectations.Create, pod.Name)
-		q.Add(*req)
+		if isSatisfied {
+			// If the scale expectation is satisfied, it should be an existing Pod and the Informer
+			// cache should have just synced.
+			q.AddAfter(*req, initialingRateLimiter.When(req))
+		} else {
+			// Otherwise, add it immediately and reset the rate limiter
+			initialingRateLimiter.Forget(req)
+			q.Add(*req)
+		}
 		return
 	}
 
@@ -72,7 +93,7 @@ func (e *podEventHandler) Create(evt event.CreateEvent, q workqueue.RateLimiting
 	if len(csList) == 0 {
 		return
 	}
-	klog.V(4).Infof("Orphan Pod %s/%s created, matched owner: %s", pod.Namespace, pod.Name, e.joinCloneSetNames(csList))
+	klog.V(4).InfoS("Orphan Pod created", "pod", klog.KObj(pod), "owner", e.joinCloneSetNames(csList))
 	for _, cs := range csList {
 		q.Add(reconcile.Request{NamespacedName: types.NamespacedName{
 			Name:      cs.GetName(),
@@ -81,7 +102,7 @@ func (e *podEventHandler) Create(evt event.CreateEvent, q workqueue.RateLimiting
 	}
 }
 
-func (e *podEventHandler) Update(evt event.UpdateEvent, q workqueue.RateLimitingInterface) {
+func (e *podEventHandler) Update(ctx context.Context, evt event.UpdateEvent, q workqueue.RateLimitingInterface) {
 	oldPod := evt.ObjectOld.(*v1.Pod)
 	curPod := evt.ObjectNew.(*v1.Pod)
 	if curPod.ResourceVersion == oldPod.ResourceVersion {
@@ -97,10 +118,10 @@ func (e *podEventHandler) Update(evt event.UpdateEvent, q workqueue.RateLimiting
 		// for modification of the deletion timestamp and expect an rs to create more replicas asap, not wait
 		// until the kubelet actually deletes the pod. This is different from the Phase of a pod changing, because
 		// an rs never initiates a phase change, and so is never asleep waiting for the same.
-		e.Delete(event.DeleteEvent{Object: evt.ObjectNew}, q)
+		e.Delete(ctx, event.DeleteEvent{Object: evt.ObjectNew}, q)
 		if labelChanged {
 			// we don't need to check the oldPod.DeletionTimestamp because DeletionTimestamp cannot be unset.
-			e.Delete(event.DeleteEvent{Object: evt.ObjectOld}, q)
+			e.Delete(ctx, event.DeleteEvent{Object: evt.ObjectOld}, q)
 		}
 		return
 	}
@@ -117,11 +138,25 @@ func (e *podEventHandler) Update(evt event.UpdateEvent, q workqueue.RateLimiting
 
 	// If it has a ControllerRef, that's all that matters.
 	if curControllerRef != nil {
+		// TODO(Abner-1): delete it when fixes only resize resource
+		//old, _ := json.Marshal(oldPod)
+		//cur, _ := json.Marshal(curPod)
+		//patches, _ := jsonpatch.CreatePatch(old, cur)
+		//pjson, _ := json.Marshal(patches)
+		//klog.V(4).InfoS("Pod updated json", "pod", klog.KObj(curPod), "patch", pjson)
+
 		req := resolveControllerRef(curPod.Namespace, curControllerRef)
 		if req == nil {
 			return
 		}
-		klog.V(4).Infof("Pod %s/%s updated, owner: %s", curPod.Namespace, curPod.Name, req.Name)
+
+		if utilfeature.DefaultFeatureGate.Enabled(features.CloneSetEventHandlerOptimization) {
+			if !controllerRefChanged && !labelChanged && e.shouldIgnoreUpdate(req, oldPod, curPod) {
+				return
+			}
+		}
+
+		klog.V(4).InfoS("Pod updated", "pod", klog.KObj(curPod), "owner", req)
 		q.Add(*req)
 		return
 	}
@@ -133,8 +168,7 @@ func (e *podEventHandler) Update(evt event.UpdateEvent, q workqueue.RateLimiting
 		if len(csList) == 0 {
 			return
 		}
-		klog.V(4).Infof("Orphan Pod %s/%s updated, matched owner: %s",
-			curPod.Namespace, curPod.Name, e.joinCloneSetNames(csList))
+		klog.V(4).InfoS("Orphan Pod updated", "pod", klog.KObj(curPod), "owner", e.joinCloneSetNames(csList))
 		for _, cs := range csList {
 			q.Add(reconcile.Request{NamespacedName: types.NamespacedName{
 				Name:      cs.GetName(),
@@ -144,10 +178,19 @@ func (e *podEventHandler) Update(evt event.UpdateEvent, q workqueue.RateLimiting
 	}
 }
 
-func (e *podEventHandler) Delete(evt event.DeleteEvent, q workqueue.RateLimitingInterface) {
+func (e *podEventHandler) shouldIgnoreUpdate(req *reconcile.Request, oldPod, curPod *v1.Pod) bool {
+	cs := &appsv1alpha1.CloneSet{}
+	if err := e.Get(context.TODO(), req.NamespacedName, cs); err != nil {
+		return false
+	}
+
+	return clonesetcore.New(cs).IgnorePodUpdateEvent(oldPod, curPod)
+}
+
+func (e *podEventHandler) Delete(ctx context.Context, evt event.DeleteEvent, q workqueue.RateLimitingInterface) {
 	pod, ok := evt.Object.(*v1.Pod)
 	if !ok {
-		klog.Errorf("DeleteEvent parse pod failed, DeleteStateUnknown: %#v, obj: %#v", evt.DeleteStateUnknown, evt.Object)
+		klog.ErrorS(nil, "Skipped pod deletion event", "deleteStateUnknown", evt.DeleteStateUnknown, "obj", evt.Object)
 		return
 	}
 	clonesetutils.ResourceVersionExpectations.Delete(pod)
@@ -162,13 +205,12 @@ func (e *podEventHandler) Delete(evt event.DeleteEvent, q workqueue.RateLimiting
 		return
 	}
 
-	klog.V(4).Infof("Pod %s/%s deleted, owner: %s", pod.Namespace, pod.Name, req.Name)
+	klog.V(4).InfoS("Pod deleted", "pod", klog.KObj(pod), "owner", req)
 	clonesetutils.ScaleExpectations.ObserveScale(req.String(), expectations.Delete, pod.Name)
-	clonesetutils.UpdateExpectations.DeleteObject(req.String(), pod)
 	q.Add(*req)
 }
 
-func (e *podEventHandler) Generic(evt event.GenericEvent, q workqueue.RateLimitingInterface) {
+func (e *podEventHandler) Generic(ctx context.Context, evt event.GenericEvent, q workqueue.RateLimitingInterface) {
 
 }
 
@@ -176,7 +218,7 @@ func resolveControllerRef(namespace string, controllerRef *metav1.OwnerReference
 	// Parse the Group out of the OwnerReference to compare it to what was parsed out of the requested OwnerType
 	refGV, err := schema.ParseGroupVersion(controllerRef.APIVersion)
 	if err != nil {
-		klog.Errorf("Could not parse OwnerReference %v APIVersion: %v", controllerRef, err)
+		klog.ErrorS(err, "Could not parse APIVersion in OwnerReference", "ownerRef", controllerRef)
 		return nil
 	}
 
@@ -214,8 +256,7 @@ func (e *podEventHandler) getPodCloneSets(pod *v1.Pod) []appsv1alpha1.CloneSet {
 	if len(csMatched) > 1 {
 		// ControllerRef will ensure we don't do anything crazy, but more than one
 		// item in this list nevertheless constitutes user error.
-		klog.Warningf("Error! More than one CloneSet is selecting pod %s/%s : %s",
-			pod.Namespace, pod.Name, e.joinCloneSetNames(csMatched))
+		klog.InfoS("Error! More than one CloneSet is selecting pod", "pod", klog.KObj(pod), "cloneSets", e.joinCloneSetNames(csMatched))
 	}
 	return csMatched
 }
@@ -233,32 +274,41 @@ type pvcEventHandler struct {
 
 var _ handler.EventHandler = &pvcEventHandler{}
 
-func (e *pvcEventHandler) Create(evt event.CreateEvent, q workqueue.RateLimitingInterface) {
+func (e *pvcEventHandler) Create(ctx context.Context, evt event.CreateEvent, q workqueue.RateLimitingInterface) {
 	pvc := evt.Object.(*v1.PersistentVolumeClaim)
 	if pvc.DeletionTimestamp != nil {
-		e.Delete(event.DeleteEvent{Object: evt.Object}, q)
+		e.Delete(ctx, event.DeleteEvent{Object: evt.Object}, q)
 		return
 	}
 
 	if controllerRef := metav1.GetControllerOf(pvc); controllerRef != nil {
 		if req := resolveControllerRef(pvc.Namespace, controllerRef); req != nil {
+			isSatisfied, _, _ := clonesetutils.ScaleExpectations.SatisfiedExpectations(req.String())
 			clonesetutils.ScaleExpectations.ObserveScale(req.String(), expectations.Create, pvc.Name)
-			q.Add(*req)
+			if isSatisfied {
+				// If the scale expectation is satisfied, it should be an existing Pod and the Informer
+				// cache should have just synced.
+				q.AddAfter(*req, initialingRateLimiter.When(req))
+			} else {
+				// Otherwise, add it immediately and reset the rate limiter
+				initialingRateLimiter.Forget(req)
+				q.Add(*req)
+			}
 		}
 	}
 }
 
-func (e *pvcEventHandler) Update(evt event.UpdateEvent, q workqueue.RateLimitingInterface) {
+func (e *pvcEventHandler) Update(ctx context.Context, evt event.UpdateEvent, q workqueue.RateLimitingInterface) {
 	pvc := evt.ObjectNew.(*v1.PersistentVolumeClaim)
 	if pvc.DeletionTimestamp != nil {
-		e.Delete(event.DeleteEvent{Object: evt.ObjectNew}, q)
+		e.Delete(ctx, event.DeleteEvent{Object: evt.ObjectNew}, q)
 	}
 }
 
-func (e *pvcEventHandler) Delete(evt event.DeleteEvent, q workqueue.RateLimitingInterface) {
+func (e *pvcEventHandler) Delete(ctx context.Context, evt event.DeleteEvent, q workqueue.RateLimitingInterface) {
 	pvc, ok := evt.Object.(*v1.PersistentVolumeClaim)
 	if !ok {
-		klog.Errorf("DeleteEvent parse pvc failed, DeleteStateUnknown: %#v, obj: %#v", evt.DeleteStateUnknown, evt.Object)
+		klog.ErrorS(nil, "Skipped pvc deletion event", "deleteStateUnknown", evt.DeleteStateUnknown, "obj", evt.Object)
 		return
 	}
 
@@ -270,6 +320,6 @@ func (e *pvcEventHandler) Delete(evt event.DeleteEvent, q workqueue.RateLimiting
 	}
 }
 
-func (e *pvcEventHandler) Generic(evt event.GenericEvent, q workqueue.RateLimitingInterface) {
+func (e *pvcEventHandler) Generic(ctx context.Context, evt event.GenericEvent, q workqueue.RateLimitingInterface) {
 
 }

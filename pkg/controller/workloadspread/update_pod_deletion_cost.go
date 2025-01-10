@@ -23,6 +23,7 @@ import (
 	"strconv"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/klog/v2"
@@ -33,12 +34,66 @@ import (
 	wsutil "github.com/openkruise/kruise/pkg/util/workloadspread"
 )
 
+const (
+	// RevisionAnnotation is the revision annotation of a deployment's replica sets which records its rollout sequence
+	RevisionAnnotation = "deployment.kubernetes.io/revision"
+)
+
+func (r *ReconcileWorkloadSpread) getWorkloadLatestVersion(ws *appsv1alpha1.WorkloadSpread) (string, error) {
+	targetRef := ws.Spec.TargetReference
+	if targetRef == nil {
+		return "", nil
+	}
+
+	gvk := schema.FromAPIVersionAndKind(targetRef.APIVersion, targetRef.Kind)
+	key := types.NamespacedName{Namespace: ws.Namespace, Name: targetRef.Name}
+
+	object := wsutil.GenerateEmptyWorkloadObject(gvk, key)
+	if err := r.Get(context.TODO(), key, object); err != nil {
+		return "", client.IgnoreNotFound(err)
+	}
+
+	return wsutil.GetWorkloadVersion(r.Client, object)
+}
+
 func (r *ReconcileWorkloadSpread) updateDeletionCost(ws *appsv1alpha1.WorkloadSpread,
-	podMap map[string][]*corev1.Pod,
+	versionedPodMap map[string]map[string][]*corev1.Pod,
 	workloadReplicas int32) error {
+	targetRef := ws.Spec.TargetReference
+	if targetRef == nil || !isEffectiveKindForDeletionCost(targetRef) {
+		return nil
+	}
+
+	latestVersion, err := r.getWorkloadLatestVersion(ws)
+	if err != nil {
+		klog.ErrorS(err, "Failed to get the latest version for workload in workloadSpread", "workloadSpread", klog.KObj(ws))
+		return err
+	}
+
+	// To try our best to keep the distribution of workload description during workload rolling:
+	// - to the latest version, we hope to scale down the last subset preferentially;
+	// - to other old versions, we hope to scale down the first subset preferentially;
+	for version, podMap := range versionedPodMap {
+		err = r.updateDeletionCostBySubset(ws, podMap, workloadReplicas, version != latestVersion)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *ReconcileWorkloadSpread) updateDeletionCostBySubset(ws *appsv1alpha1.WorkloadSpread,
+	podMap map[string][]*corev1.Pod, workloadReplicas int32, reverseOrder bool) error {
+	subsetNum := len(ws.Spec.Subsets)
+	subsetIndex := func(index int) int {
+		if reverseOrder {
+			return subsetNum - index - 1
+		}
+		return index
+	}
 	// update Pod's deletion-cost annotation in each subset
 	for idx, subset := range ws.Spec.Subsets {
-		if err := r.syncSubsetPodDeletionCost(ws, &subset, idx, podMap[subset.Name], workloadReplicas); err != nil {
+		if err := r.syncSubsetPodDeletionCost(ws, &subset, subsetIndex(idx), podMap[subset.Name], workloadReplicas); err != nil {
 			return err
 		}
 	}
@@ -54,20 +109,20 @@ func (r *ReconcileWorkloadSpread) updateDeletionCost(ws *appsv1alpha1.WorkloadSp
 
 // syncSubsetPodDeletionCost calculates the deletion-cost for the Pods belong to subset and update deletion-cost annotation.
 // We have two conditions for subset's Pod deletion-cost
-// 1. the number of active Pods in this subset <= maxReplicas or maxReplicas = nil, deletion-cost = 100 * (subsets.length - subsetIndex).
-//                 subset-a   subset-b  subset-c
-//    maxReplicas    10          10        nil
-//    pods number    10          10        10
-//    deletion-cost  300         200       100
-//    We delete Pods from back subset to front subset. The deletion order is: c -> b -> a.
-// 2. the number of active Pods in this subset > maxReplicas
-//    two class:
-//    (a) the extra Pods more than maxReplicas: deletion-cost = -100 * (subsetIndex + 1) [Priority Deletion],
-//    (b) deletion-cost = 100 * (subsets.length - subsetIndex) [Reserve].
-//                 subset-a       subset-b     subset-c
-//    maxReplicas    10            10           nil
-//    pods number    20            20           20
-//    deletion-cost (300,-100)    (200,-200)    100
+//  1. the number of active Pods in this subset <= maxReplicas or maxReplicas = nil, deletion-cost = 100 * (subsets.length - subsetIndex).
+//     name         subset-a   subset-b  subset-c
+//     maxReplicas    10          10        nil
+//     pods number    10          10        10
+//     deletion-cost  300         200       100
+//     We delete Pods from back subset to front subset. The deletion order is: c -> b -> a.
+//  2. the number of active Pods in this subset > maxReplicas
+//     two class:
+//     (a) the extra Pods more than maxReplicas: deletion-cost = -100 * (subsetIndex + 1) [Priority Deletion],
+//     (b) deletion-cost = 100 * (subsets.length - subsetIndex) [Reserve].
+//     name         subset-a       subset-b     subset-c
+//     maxReplicas    10            10           nil
+//     pods number    20            20           20
+//     deletion-cost (300,-100)    (200,-200)    100
 func (r *ReconcileWorkloadSpread) syncSubsetPodDeletionCost(
 	ws *appsv1alpha1.WorkloadSpread,
 	subset *appsv1alpha1.WorkloadSpreadSubset,
@@ -99,8 +154,7 @@ func (r *ReconcileWorkloadSpread) syncSubsetPodDeletionCost(
 	} else {
 		subsetMaxReplicas, err := intstr.GetValueFromIntOrPercent(subset.MaxReplicas, int(workloadReplicas), true)
 		if err != nil || subsetMaxReplicas < 0 {
-			klog.Errorf("failed to get maxReplicas value from subset (%s) of WorkloadSpread (%s/%s)",
-				subset.Name, ws.Namespace, ws.Name)
+			klog.ErrorS(err, "Failed to get maxReplicas value from subset of WorkloadSpread", "subsetName", subset.Name, "workloadSpread", klog.KObj(ws))
 			return nil
 		}
 
@@ -130,12 +184,7 @@ func (r *ReconcileWorkloadSpread) syncSubsetPodDeletionCost(
 	if err != nil {
 		return err
 	}
-	err = r.updateDeletionCostForSubsetPods(ws, subset, negativePods, strconv.Itoa(wsutil.PodDeletionCostNegative*(subsetIndex+1)))
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return r.updateDeletionCostForSubsetPods(ws, subset, negativePods, strconv.Itoa(wsutil.PodDeletionCostNegative*(subsetIndex+1)))
 }
 
 func (r *ReconcileWorkloadSpread) updateDeletionCostForSubsetPods(ws *appsv1alpha1.WorkloadSpread,
@@ -177,8 +226,7 @@ func (r *ReconcileWorkloadSpread) patchPodDeletionCost(ws *appsv1alpha1.Workload
 	if err := r.Patch(context.TODO(), clone, client.RawPatch(types.StrategicMergePatchType, []byte(body))); err != nil {
 		return err
 	}
-	klog.V(3).Infof("WorkloadSpread (%s/%s) paths deletion-cost annotation to %s for Pod (%s/%s) successfully",
-		ws.Namespace, ws.Name, deletionCostStr, pod.Namespace, pod.Name)
+	klog.V(3).InfoS("WorkloadSpread patched deletion-cost annotation for Pod successfully", "workloadSpread", klog.KObj(ws), "deletionCost", deletionCostStr, "pod", klog.KObj(pod))
 	return nil
 }
 
@@ -202,4 +250,12 @@ func sortDeleteIndexes(pods []*corev1.Pod) []int {
 	})
 
 	return waitDeleteIndexes
+}
+
+func isEffectiveKindForDeletionCost(targetRef *appsv1alpha1.TargetReference) bool {
+	switch targetRef.Kind {
+	case controllerKindRS.Kind, controllerKindDep.Kind, controllerKruiseKindCS.Kind:
+		return true
+	}
+	return false
 }

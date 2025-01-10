@@ -23,6 +23,7 @@ import (
 	"reflect"
 	"testing"
 
+	appspub "github.com/openkruise/kruise/apis/apps/pub"
 	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
 	"github.com/openkruise/kruise/pkg/control/sidecarcontrol"
 
@@ -92,6 +93,7 @@ func factoryPodsCommon(count, upgraded int, sidecarSet *appsv1alpha1.SidecarSet)
 	}
 	for i := 0; i < upgraded; i++ {
 		pods[i].Spec.Containers[1].Image = "test-image:v2"
+		sidecarcontrol.UpdatePodSidecarSetHash(pods[i], control.GetSidecarset())
 		control.UpdatePodAnnotationsInUpgrade([]string{"test-sidecar"}, pods[i])
 	}
 	return pods
@@ -109,11 +111,19 @@ func factoryPods(count, upgraded, upgradedAndReady int) []*corev1.Pod {
 }
 
 func factorySidecarSet() *appsv1alpha1.SidecarSet {
+	return createFactorySidecarSet("bbb", "without-aaa")
+}
+
+func factorySidecarSetNotUpgradable() *appsv1alpha1.SidecarSet {
+	return createFactorySidecarSet("bbb", "without-bbb")
+}
+
+func createFactorySidecarSet(sidecarsetHash string, sidecarsetHashWithoutImage string) *appsv1alpha1.SidecarSet {
 	sidecarSet := &appsv1alpha1.SidecarSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Annotations: map[string]string{
-				sidecarcontrol.SidecarSetHashAnnotation:             "bbb",
-				sidecarcontrol.SidecarSetHashWithoutImageAnnotation: "without-aaa",
+				sidecarcontrol.SidecarSetHashAnnotation:             sidecarsetHash,
+				sidecarcontrol.SidecarSetHashWithoutImageAnnotation: sidecarsetHashWithoutImage,
 			},
 			Name:   "test-sidecarset",
 			Labels: map[string]string{},
@@ -146,10 +156,11 @@ func TestGetNextUpgradePods(t *testing.T) {
 
 func testGetNextUpgradePods(t *testing.T, factoryPods FactoryPods, factorySidecar FactorySidecarSet) {
 	cases := []struct {
-		name                   string
-		getPods                func() []*corev1.Pod
-		getSidecarset          func() *appsv1alpha1.SidecarSet
-		exceptNeedUpgradeCount int
+		name                     string
+		getPods                  func() []*corev1.Pod
+		getSidecarset            func() *appsv1alpha1.SidecarSet
+		exceptNeedUpgradeCount   int
+		exceptNotUpgradableCount int
 	}{
 		{
 			name: "only maxUnavailable(int=10), and pods(count=100, upgraded=30, upgradedAndReady=26)",
@@ -165,7 +176,8 @@ func testGetNextUpgradePods(t *testing.T, factoryPods FactoryPods, factorySideca
 				}
 				return sidecarSet
 			},
-			exceptNeedUpgradeCount: 6,
+			exceptNeedUpgradeCount:   6,
+			exceptNotUpgradableCount: 0,
 		},
 		{
 			name: "only maxUnavailable(string=10%), and pods(count=1000, upgraded=300, upgradedAndReady=260)",
@@ -181,7 +193,8 @@ func testGetNextUpgradePods(t *testing.T, factoryPods FactoryPods, factorySideca
 				}
 				return sidecarSet
 			},
-			exceptNeedUpgradeCount: 60,
+			exceptNeedUpgradeCount:   60,
+			exceptNotUpgradableCount: 0,
 		},
 		{
 			name: "only maxUnavailable(string=5%), and pods(count=1000, upgraded=300, upgradedAndReady=250)",
@@ -197,7 +210,8 @@ func testGetNextUpgradePods(t *testing.T, factoryPods FactoryPods, factorySideca
 				}
 				return sidecarSet
 			},
-			exceptNeedUpgradeCount: 0,
+			exceptNeedUpgradeCount:   0,
+			exceptNotUpgradableCount: 0,
 		},
 		{
 			name: "only maxUnavailable(int=100), and pods(count=100, upgraded=30, upgradedAndReady=27)",
@@ -213,7 +227,8 @@ func testGetNextUpgradePods(t *testing.T, factoryPods FactoryPods, factorySideca
 				}
 				return sidecarSet
 			},
-			exceptNeedUpgradeCount: 70,
+			exceptNeedUpgradeCount:   70,
+			exceptNotUpgradableCount: 0,
 		},
 		{
 			name: "partition(int=180) maxUnavailable(int=100), and pods(count=1000, upgraded=800, upgradedAndReady=760)",
@@ -233,7 +248,8 @@ func testGetNextUpgradePods(t *testing.T, factoryPods FactoryPods, factorySideca
 				}
 				return sidecarSet
 			},
-			exceptNeedUpgradeCount: 20,
+			exceptNeedUpgradeCount:   20,
+			exceptNotUpgradableCount: 0,
 		},
 		{
 			name: "partition(int=100) maxUnavailable(int=100), and pods(count=1000, upgraded=800, upgradedAndReady=760)",
@@ -253,7 +269,8 @@ func testGetNextUpgradePods(t *testing.T, factoryPods FactoryPods, factorySideca
 				}
 				return sidecarSet
 			},
-			exceptNeedUpgradeCount: 60,
+			exceptNeedUpgradeCount:   60,
+			exceptNotUpgradableCount: 0,
 		},
 		{
 			name: "partition(string=18%) maxUnavailable(int=100), and pods(count=1000, upgraded=800, upgradedAndReady=760)",
@@ -273,7 +290,8 @@ func testGetNextUpgradePods(t *testing.T, factoryPods FactoryPods, factorySideca
 				}
 				return sidecarSet
 			},
-			exceptNeedUpgradeCount: 20,
+			exceptNeedUpgradeCount:   20,
+			exceptNotUpgradableCount: 0,
 		},
 		{
 			name: "partition(string=10%) maxUnavailable(int=100), and pods(count=1000, upgraded=800, upgradedAndReady=760)",
@@ -293,7 +311,8 @@ func testGetNextUpgradePods(t *testing.T, factoryPods FactoryPods, factorySideca
 				}
 				return sidecarSet
 			},
-			exceptNeedUpgradeCount: 60,
+			exceptNeedUpgradeCount:   60,
+			exceptNotUpgradableCount: 0,
 		},
 		{
 			name: "selector(app=test, count=30) maxUnavailable(int=100), and pods(count=1000, upgraded=0, upgradedAndReady=0)",
@@ -315,7 +334,85 @@ func testGetNextUpgradePods(t *testing.T, factoryPods FactoryPods, factorySideca
 				}
 				return sidecarSet
 			},
-			exceptNeedUpgradeCount: 30,
+			exceptNeedUpgradeCount:   30,
+			exceptNotUpgradableCount: 0,
+		},
+		{
+			name: "not upgradable sidecarset, maxUnavailable(int=100), and pods(count=100, upgraded=0, upgradedAndReady=0)",
+			getPods: func() []*corev1.Pod {
+				pods := factoryPods(100, 0, 0)
+				return Random(pods)
+			},
+			getSidecarset: func() *appsv1alpha1.SidecarSet {
+				sidecarSet := factorySidecarSetNotUpgradable()
+				sidecarSet.Spec.UpdateStrategy.MaxUnavailable = &intstr.IntOrString{
+					Type:   intstr.Int,
+					IntVal: 100,
+				}
+
+				return sidecarSet
+			},
+			exceptNeedUpgradeCount:   0,
+			exceptNotUpgradableCount: 100,
+		},
+		{
+			name: "only maxUnavailable(5%), and pods(count=5, upgraded=0, upgradedAndReady=0)",
+			getPods: func() []*corev1.Pod {
+				pods := factoryPods(5, 0, 0)
+				return Random(pods)
+			},
+			getSidecarset: func() *appsv1alpha1.SidecarSet {
+				sidecarSet := factorySidecar()
+				sidecarSet.Spec.UpdateStrategy.MaxUnavailable = &intstr.IntOrString{
+					Type:   intstr.String,
+					StrVal: "5%",
+				}
+				return sidecarSet
+			},
+			exceptNeedUpgradeCount:   1,
+			exceptNotUpgradableCount: 0,
+		},
+		{
+			name: "maxUnavailable(5) partition(99%), and pods(count=5, upgraded=0, upgradedAndReady=0)",
+			getPods: func() []*corev1.Pod {
+				pods := factoryPods(5, 0, 0)
+				return Random(pods)
+			},
+			getSidecarset: func() *appsv1alpha1.SidecarSet {
+				sidecarSet := factorySidecar()
+				sidecarSet.Spec.UpdateStrategy.MaxUnavailable = &intstr.IntOrString{
+					Type:   intstr.Int,
+					IntVal: 5,
+				}
+				sidecarSet.Spec.UpdateStrategy.Partition = &intstr.IntOrString{
+					Type:   intstr.String,
+					StrVal: "99%",
+				}
+				return sidecarSet
+			},
+			exceptNeedUpgradeCount:   1,
+			exceptNotUpgradableCount: 0,
+		},
+		{
+			name: "maxUnavailable(5) partition(1%), and pods(count=5, upgraded=0, upgradedAndReady=0)",
+			getPods: func() []*corev1.Pod {
+				pods := factoryPods(5, 0, 0)
+				return Random(pods)
+			},
+			getSidecarset: func() *appsv1alpha1.SidecarSet {
+				sidecarSet := factorySidecar()
+				sidecarSet.Spec.UpdateStrategy.MaxUnavailable = &intstr.IntOrString{
+					Type:   intstr.Int,
+					IntVal: 5,
+				}
+				sidecarSet.Spec.UpdateStrategy.Partition = &intstr.IntOrString{
+					Type:   intstr.String,
+					StrVal: "1%",
+				}
+				return sidecarSet
+			},
+			exceptNeedUpgradeCount:   4,
+			exceptNotUpgradableCount: 0,
 		},
 	}
 	strategy := NewStrategy()
@@ -323,9 +420,12 @@ func testGetNextUpgradePods(t *testing.T, factoryPods FactoryPods, factorySideca
 		t.Run(cs.name, func(t *testing.T) {
 			control := sidecarcontrol.New(cs.getSidecarset())
 			pods := cs.getPods()
-			injectedPods := strategy.GetNextUpgradePods(control, pods)
-			if cs.exceptNeedUpgradeCount != len(injectedPods) {
-				t.Fatalf("except NeedUpgradeCount(%d), but get value(%d)", cs.exceptNeedUpgradeCount, len(injectedPods))
+			upgradePods, notUpgradablePods := strategy.GetNextUpgradePods(control, pods)
+			if cs.exceptNeedUpgradeCount != len(upgradePods) {
+				t.Fatalf("except NeedUpgradeCount(%d), but get value(%d)", cs.exceptNeedUpgradeCount, len(upgradePods))
+			}
+			if cs.exceptNotUpgradableCount != len(notUpgradablePods) {
+				t.Fatalf("except NotUpgradableCount(%d), but get value(%d)", cs.exceptNotUpgradableCount, len(notUpgradablePods))
 			}
 		})
 	}
@@ -516,6 +616,72 @@ func testSortNextUpgradePods(t *testing.T, factoryPods FactoryPods, factorySidec
 			},
 			exceptNextUpgradePods: []string{"pod-13", "pod-10", "pod-19", "pod-18", "pod-17", "pod-16", "pod-15"},
 		},
+		{
+			name: "with weight priority strategy, maxUnavailable(int=10) and pods(count=20, upgraded=10, upgradedAndReady=2)",
+			getPods: func() []*corev1.Pod {
+				pods := factoryPods(20, 10, 2)
+				pods[15].Labels["test-key"] = "bar"
+				pods[16].Labels["test-key"] = "foo"
+				return Random(pods)
+			},
+			getSidecarset: func() *appsv1alpha1.SidecarSet {
+				sidecarSet := factorySidecar()
+				sidecarSet.Spec.UpdateStrategy.MaxUnavailable = &intstr.IntOrString{
+					Type:   intstr.Int,
+					IntVal: 10,
+				}
+				sidecarSet.Spec.UpdateStrategy.PriorityStrategy = &appspub.UpdatePriorityStrategy{
+					WeightPriority: []appspub.UpdatePriorityWeightTerm{
+						{
+							Weight: 50,
+							MatchSelector: metav1.LabelSelector{
+								MatchLabels: map[string]string{
+									"test-key": "foo",
+								},
+							},
+						},
+						{
+							Weight: 30,
+							MatchSelector: metav1.LabelSelector{
+								MatchLabels: map[string]string{
+									"test-key": "bar",
+								},
+							},
+						},
+					},
+				}
+				return sidecarSet
+			},
+			exceptNextUpgradePods: []string{"pod-16", "pod-15"},
+		},
+		{
+			name: "with order priority strategy, maxUnavailable(int=10) and pods(count=20, upgraded=10, upgradedAndReady=2)",
+			getPods: func() []*corev1.Pod {
+				pods := factoryPods(20, 10, 2)
+				for i := 0; i < 20; i++ {
+					pods[i].Labels["key1"] = "5"
+				}
+				pods[17].Labels["key1"] = "10"
+				pods[18].Labels["key1"] = "20"
+				return Random(pods)
+			},
+			getSidecarset: func() *appsv1alpha1.SidecarSet {
+				sidecarSet := factorySidecar()
+				sidecarSet.Spec.UpdateStrategy.MaxUnavailable = &intstr.IntOrString{
+					Type:   intstr.Int,
+					IntVal: 10,
+				}
+				sidecarSet.Spec.UpdateStrategy.PriorityStrategy = &appspub.UpdatePriorityStrategy{
+					OrderPriority: []appspub.UpdatePriorityOrderTerm{
+						{
+							OrderedKey: "key1",
+						},
+					},
+				}
+				return sidecarSet
+			},
+			exceptNextUpgradePods: []string{"pod-18", "pod-17"},
+		},
 	}
 
 	strategy := NewStrategy()
@@ -523,7 +689,7 @@ func testSortNextUpgradePods(t *testing.T, factoryPods FactoryPods, factorySidec
 		t.Run(cs.name, func(t *testing.T) {
 			control := sidecarcontrol.New(cs.getSidecarset())
 			pods := cs.getPods()
-			injectedPods := strategy.GetNextUpgradePods(control, pods)
+			injectedPods, _ := strategy.GetNextUpgradePods(control, pods)
 			if len(cs.exceptNextUpgradePods) != len(injectedPods) {
 				t.Fatalf("except NeedUpgradeCount(%d), but get value(%d)", len(cs.exceptNextUpgradePods), len(injectedPods))
 			}

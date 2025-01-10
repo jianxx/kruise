@@ -1,32 +1,49 @@
-# Build the manager binary
-FROM golang:1.17 as builder
+# Build the manager and daemon binaries
+ARG BASE_IMAGE=alpine
+ARG BASE_IMAGE_VERSION=3.19@sha256:ae65dbf8749a7d4527648ccee1fa3deb6bfcae34cbc30fc67aa45c44dcaa90ee
+FROM golang:1.20.14-alpine3.19@sha256:e47f121850f4e276b2b210c56df3fda9191278dd84a3a442bfe0b09934462a8f as builder
 
 WORKDIR /workspace
 # Copy the Go Modules manifests
 COPY go.mod go.mod
 COPY go.sum go.sum
-# cache deps before building and copying source so that we don't need to re-download as much
-# and so that source changes don't invalidate our downloaded layer
-#RUN go mod download
 
 # Copy the go source
 COPY main.go main.go
 COPY apis/ apis/
 COPY cmd/ cmd/
 COPY pkg/ pkg/
-COPY vendor/ vendor/
 
 # Build
-RUN CGO_ENABLED=0 GO111MODULE=on go build -mod=vendor -a -o manager main.go \
-  && CGO_ENABLED=0 GO111MODULE=on go build -mod=vendor -a -o daemon ./cmd/daemon/main.go
+RUN CGO_ENABLED=0 GO111MODULE=on go build -a -o manager main.go \
+  && CGO_ENABLED=0 GO111MODULE=on go build -a -o daemon ./cmd/daemon/main.go
 
-# Use Ubuntu 20.04 LTS as base image to package the manager binary
-FROM ubuntu:focal
-# This is required by daemon connnecting with cri
-RUN ln -s /usr/bin/* /usr/sbin/ && apt-get update -y \
-  && apt-get install --no-install-recommends -y ca-certificates \
-  && apt-get clean && rm -rf /var/log/*log /var/lib/apt/lists/* /var/log/apt/* /var/lib/dpkg/*-old /var/cache/debconf/*-old
+ARG BASE_IMAGE
+ARG BASE_IMAGE_VERSION
+FROM ${BASE_IMAGE}:${BASE_IMAGE_VERSION}
+
 WORKDIR /
 COPY --from=builder /workspace/manager .
 COPY --from=builder /workspace/daemon ./kruise-daemon
+
+RUN set -eux; \
+    mkdir -p /log /tmp && \
+    chown -R nobody:nobody /log && \
+    chown -R nobody:nobody /tmp && \
+    chown -R nobody:nobody /manager && \
+    apk --no-cache --update upgrade && \
+    apk --no-cache add ca-certificates && \
+    apk --no-cache add tzdata && \
+    rm -rf /var/cache/apk/* && \
+    update-ca-certificates && \
+    echo "only include root and nobody user" && \
+    echo -e "root:x:0:0:root:/root:/bin/ash\nnobody:x:65534:65534:nobody:/:/sbin/nologin" | tee /etc/passwd && \
+    echo -e "root:x:0:root\nnobody:x:65534:" | tee /etc/group && \
+    rm -rf /usr/local/sbin/* && \
+    rm -rf /usr/local/bin/* && \
+    rm -rf /usr/sbin/* && \
+    rm -rf /usr/bin/* && \
+    rm -rf /sbin/* && \
+    rm -rf /bin/*
+
 ENTRYPOINT ["/manager"]
